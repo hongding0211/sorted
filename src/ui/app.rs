@@ -23,7 +23,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use sysinfo::Disks;
 
@@ -178,7 +178,7 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
+fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let status_height = if app.is_copy_active() { 6 } else { 4 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -213,7 +213,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(keyboard, layout[3]);
 }
 
-fn draw_main(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -223,7 +223,7 @@ fn draw_main(frame: &mut Frame<'_>, app: &App, area: Rect) {
     draw_session(frame, app, columns[1]);
 }
 
-fn draw_source_tree(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_source_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items = if app.source_entries.is_empty() {
         if app.devices_loading {
             vec![
@@ -249,19 +249,23 @@ fn draw_source_tree(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ]
         }
     } else {
-        browser_list_items(
-            &app.source_entries,
-            app.source_index,
-            app.focus == FocusField::SourceTree,
-            app.loading_glyph(),
-        )
+        browser_list_items(&app.source_entries, app.loading_glyph())
     };
 
-    let widget = List::new(items).block(panel_block(
-        "Source Browser",
-        app.focus == FocusField::SourceTree,
-    ));
-    frame.render_widget(widget, area);
+    let widget = List::new(items)
+        .highlight_style(focus_style())
+        .block(panel_block(
+            "Source Browser",
+            app.focus == FocusField::SourceTree,
+        ));
+    let mut state = browser_list_state(
+        app.source_entries.len(),
+        app.source_index,
+        app.source_scroll_offset,
+        browser_viewport_height(area),
+    );
+    frame.render_stateful_widget(widget, area, &mut state);
+    app.source_scroll_offset = state.offset();
 }
 
 fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -311,7 +315,7 @@ fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(content, area);
 }
 
-fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let panels = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
@@ -340,18 +344,22 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
             )])),
         ]
     } else {
-        browser_list_items(
-            &app.settings_entries,
-            app.settings_index,
-            app.focus == FocusField::DestinationRoot,
-            app.loading_glyph(),
-        )
+        browser_list_items(&app.settings_entries, app.loading_glyph())
     };
-    let browser = List::new(settings_items).block(panel_block(
-        "Destination Browser",
-        app.focus == FocusField::DestinationRoot,
-    ));
-    frame.render_widget(browser, top[0]);
+    let browser = List::new(settings_items)
+        .highlight_style(focus_style())
+        .block(panel_block(
+            "Destination Browser",
+            app.focus == FocusField::DestinationRoot,
+        ));
+    let mut state = browser_list_state(
+        app.settings_entries.len(),
+        app.settings_index,
+        app.settings_scroll_offset,
+        browser_viewport_height(top[0]),
+    );
+    frame.render_stateful_widget(browser, top[0], &mut state);
+    app.settings_scroll_offset = state.offset();
 
     let fields = Paragraph::new(vec![
         Line::from(vec![Span::styled("Settings", title_style())]),
@@ -627,6 +635,7 @@ struct App {
     pending_directory_loads: HashSet<PathBuf>,
     source_entries: Vec<SourceEntry>,
     source_index: usize,
+    source_scroll_offset: usize,
     import_session: ImportSession,
     status_message: StatusMessage,
     screen: Screen,
@@ -646,6 +655,7 @@ struct App {
     expanded_settings_directories: BTreeSet<PathBuf>,
     settings_entries: Vec<SourceEntry>,
     settings_index: usize,
+    settings_scroll_offset: usize,
 }
 
 impl App {
@@ -663,6 +673,7 @@ impl App {
             pending_directory_loads: HashSet::new(),
             source_entries: Vec::new(),
             source_index: 0,
+            source_scroll_offset: 0,
             import_session: ImportSession::default(),
             status_message: StatusMessage::info(
                 "Starting up. Scanning devices in the background...",
@@ -684,6 +695,7 @@ impl App {
             expanded_settings_directories: BTreeSet::new(),
             settings_entries: Vec::new(),
             settings_index: 0,
+            settings_scroll_offset: 0,
         };
         app.request_device_refresh();
         app.request_destination_free_space();
@@ -1593,14 +1605,11 @@ fn read_directory_children(root: &Path) -> Vec<PathBuf> {
 
 fn browser_list_items(
     entries: &[SourceEntry],
-    selected_index: usize,
-    is_focused: bool,
     loading_glyph: &str,
 ) -> Vec<ListItem<'static>> {
     entries
         .iter()
-        .enumerate()
-        .map(|(index, entry)| {
+        .map(|entry| {
             let prefix = if entry.has_children {
                 if entry.is_expanded { "▾" } else { "▸" }
             } else {
@@ -1612,9 +1621,7 @@ fn browser_list_items(
                 String::new()
             };
             let indent = "  ".repeat(entry.depth);
-            let style = if index == selected_index && is_focused {
-                focus_style()
-            } else if entry.is_device_root && !entry.is_available {
+            let style = if entry.is_device_root && !entry.is_available {
                 semantic_style(StatusKind::Warning).add_modifier(Modifier::BOLD)
             } else if entry.is_device_root {
                 label_style()
@@ -1625,6 +1632,43 @@ fn browser_list_items(
             ListItem::new(format!("{indent}{prefix} {}{loading}", entry.label)).style(style)
         })
         .collect()
+}
+
+fn browser_list_state(
+    entry_count: usize,
+    selected_index: usize,
+    current_offset: usize,
+    viewport_height: usize,
+) -> ListState {
+    if entry_count == 0 {
+        return ListState::default();
+    }
+
+    let clamped_index = selected_index.min(entry_count.saturating_sub(1));
+    let mut state = ListState::default()
+        .with_offset(autoscroll_offset(current_offset, clamped_index, viewport_height))
+        .with_selected(Some(clamped_index));
+    *state.offset_mut() = state.offset().min(entry_count.saturating_sub(1));
+    state
+}
+
+fn autoscroll_offset(current_offset: usize, selected_index: usize, viewport_height: usize) -> usize {
+    if viewport_height == 0 {
+        return 0;
+    }
+
+    let viewport_end = current_offset.saturating_add(viewport_height);
+    if selected_index < current_offset {
+        selected_index
+    } else if selected_index >= viewport_end {
+        selected_index.saturating_add(1).saturating_sub(viewport_height)
+    } else {
+        current_offset
+    }
+}
+
+fn browser_viewport_height(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
 }
 
 fn flatten_settings_tree(
@@ -1981,6 +2025,7 @@ mod tests {
             pending_directory_loads: HashSet::new(),
             source_entries: Vec::new(),
             source_index: 0,
+            source_scroll_offset: 0,
             import_session: ImportSession::default(),
             status_message: StatusMessage::info("Ready"),
             screen: Screen::Main,
@@ -2000,6 +2045,7 @@ mod tests {
             expanded_settings_directories: BTreeSet::new(),
             settings_entries: Vec::new(),
             settings_index: 0,
+            settings_scroll_offset: 0,
         }
     }
 
@@ -2271,5 +2317,15 @@ mod tests {
         assert_eq!(app.settings.destination_root, sibling);
         assert_eq!(app.persisted_settings.destination_root, sibling);
         assert_eq!(app.config_store.load().unwrap().destination_root, sibling);
+    }
+
+    #[test]
+    fn autoscroll_offset_keeps_lower_selection_visible() {
+        assert_eq!(autoscroll_offset(0, 0, 5), 0);
+        assert_eq!(autoscroll_offset(0, 4, 5), 0);
+        assert_eq!(autoscroll_offset(0, 5, 5), 1);
+        assert_eq!(autoscroll_offset(3, 2, 5), 2);
+        assert_eq!(autoscroll_offset(3, 7, 5), 3);
+        assert_eq!(autoscroll_offset(3, 8, 5), 4);
     }
 }
