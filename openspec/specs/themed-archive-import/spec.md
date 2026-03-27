@@ -38,15 +38,15 @@ The system SHALL create destination paths using the pattern `dist/<theme><format
 - **THEN** the system renders the archive date segment using that format when building the destination folder
 
 ### Requirement: Copy supported media into the resolved archive path
-The system SHALL copy supported photo and video files from the selected source device into the resolved archive folder, SHALL report progress and completion status to the user, and SHALL present copy-state information with clear hierarchy so users can distinguish active progress, successful completion, and partial failure outcomes.
+The system SHALL copy supported photo and video files from the selected source device into the resolved archive folder, SHALL report progress and completion status to the user, SHALL render a visual progress bar in the status area while the copy is active, and MUST intercept the global quit shortcut while an archive copy job is still running so the copy can stop safely without immediately exiting the app.
 
 #### Scenario: Successful archive copy
 - **WHEN** the user confirms an import from a readable device to a writable destination
-- **THEN** the system creates the destination folders if needed, copies the selected media files into the device-specific archive folder, and shows a success-oriented completion summary when finished
+- **THEN** the system creates the destination folders if needed and copies the selected media files into the device-specific archive folder
 
 #### Scenario: Copy failure is surfaced to the user
 - **WHEN** a file copy fails during the archive process
-- **THEN** the system reports the failure, indicates that the archive session did not complete successfully, and keeps failure details readable from the results view
+- **THEN** the system reports the failure and indicates that the archive session did not complete successfully
 
 ### Requirement: Present a confirmation summary before import starts
 The system SHALL show a confirmation view before the copy begins that summarizes the selected source, resolved destination, and next action so users can review the import before committing.
@@ -60,5 +60,8 @@ The system SHALL display copy progress in a way that makes current activity, com
 
 #### Scenario: Copy progress emphasizes current state
 - **WHEN** an archive copy is running
-- **THEN** the system shows that the copy is in progress, includes a progress summary with completed versus total files, and indicates that the user must wait for the operation to finish before leaving the flow
+- **THEN** the system returns to the main archive view and shows a visual progress bar in the status area that reflects copied versus total files alongside textual progress details
 
+#### Scenario: Quit shortcut safely interrupts active copy
+- **WHEN** the user presses `Ctrl+Q` while an archive copy job is still running
+- **THEN** the system intercepts the shortcut, requests that the copy stop at a safe boundary, returns to the main archive view, and reports in the status area that the copy was interrupted

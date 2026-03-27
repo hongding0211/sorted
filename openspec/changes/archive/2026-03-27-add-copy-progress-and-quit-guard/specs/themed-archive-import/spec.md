@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Copy supported media into the resolved archive path
-The system SHALL copy supported photo and video files from the selected source device into the resolved archive folder, SHALL report progress and completion status to the user, SHALL render a visual progress bar while the copy is active, and MUST block the global quit shortcut while an archive copy job is still running.
+The system SHALL copy supported photo and video files from the selected source device into the resolved archive folder, SHALL report progress and completion status to the user, SHALL render a visual progress bar in the status area while the copy is active, and MUST intercept the global quit shortcut while an archive copy job is still running so the copy can stop safely without immediately exiting the app.
 
 #### Scenario: Successful archive copy
 - **WHEN** the user confirms an import from a readable device to a writable destination
@@ -13,8 +13,8 @@ The system SHALL copy supported photo and video files from the selected source d
 
 #### Scenario: Active copy shows visual progress
 - **WHEN** the archive copy is in progress and completed-file updates are available
-- **THEN** the system shows a visual progress bar that reflects copied versus total files alongside textual progress details
+- **THEN** the system returns to the main archive view and shows a visual progress bar in the status area that reflects copied versus total files alongside textual progress details
 
 #### Scenario: Quit shortcut is blocked during copy
 - **WHEN** the user presses `Ctrl+Q` while an archive copy job is still running
-- **THEN** the system keeps the app open, keeps the copy screen active, and informs the user that quitting is unavailable until the copy completes
+- **THEN** the system intercepts the shortcut, requests that the copy stop at a safe boundary, returns to the main archive view, and reports in the status area that the copy was interrupted

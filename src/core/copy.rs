@@ -34,6 +34,7 @@ pub struct CopySummary {
     pub destination: PathBuf,
     pub copied_files: usize,
     pub failures: Vec<CopyFailure>,
+    pub was_cancelled: bool,
 }
 
 pub fn discover_media_files(root: &Path) -> Result<Vec<MediaFile>> {
@@ -101,9 +102,14 @@ pub fn plan_copy(
     })
 }
 
-pub fn execute_copy<F>(plan: &CopyPlan, mut on_progress: F) -> Result<CopySummary>
+pub fn execute_copy<F, C>(
+    plan: &CopyPlan,
+    mut on_progress: F,
+    should_cancel: C,
+) -> Result<CopySummary>
 where
     F: FnMut(CopyProgress),
+    C: Fn() -> bool,
 {
     fs::create_dir_all(&plan.archive_plan.destination_root)?;
     ensure_archive_root(&plan.archive_plan.archive_root)?;
@@ -113,6 +119,15 @@ where
     let mut failures = Vec::new();
 
     for file in &plan.files {
+        if should_cancel() {
+            return Ok(CopySummary {
+                destination: plan.archive_plan.archive_root.clone(),
+                copied_files,
+                failures,
+                was_cancelled: true,
+            });
+        }
+
         let destination = plan.archive_plan.archive_root.join(&file.relative_path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -138,6 +153,7 @@ where
         destination: plan.archive_plan.archive_root.clone(),
         copied_files,
         failures,
+        was_cancelled: false,
     })
 }
 
@@ -188,10 +204,11 @@ mod tests {
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
         )
         .unwrap();
-        let summary = execute_copy(&plan, |_| {}).unwrap();
+        let summary = execute_copy(&plan, |_| {}, || false).unwrap();
 
         assert_eq!(summary.copied_files, 1);
         assert!(summary.failures.is_empty());
+        assert!(!summary.was_cancelled);
         assert!(summary.destination.join("DCIM/frame.jpg").exists());
     }
 
@@ -261,9 +278,53 @@ mod tests {
         .unwrap();
         assert!(!destination_root.exists());
 
-        let summary = execute_copy(&plan, |_| {}).unwrap();
+        let summary = execute_copy(&plan, |_| {}, || false).unwrap();
 
         assert!(destination_root.exists());
+        assert!(!summary.was_cancelled);
         assert!(summary.destination.join("DCIM/frame.jpg").exists());
+    }
+
+    #[test]
+    fn stops_copying_when_cancellation_is_requested() {
+        let device_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        fs::write(device_root.path().join("a.jpg"), "a").unwrap();
+        fs::write(device_root.path().join("b.jpg"), "b").unwrap();
+
+        let settings = ArchiveSettings {
+            destination_root: destination_root.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: device_root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = plan_copy(
+            &settings,
+            "shoot",
+            &device,
+            device_root.path(),
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        let cancel_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_progress = cancel_requested.clone();
+        let cancel_for_check = cancel_requested.clone();
+        let summary = execute_copy(
+            &plan,
+            move |_| {
+                cancel_for_progress.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            move || cancel_for_check.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .unwrap();
+
+        assert_eq!(summary.copied_files, 1);
+        assert!(summary.was_cancelled);
     }
 }

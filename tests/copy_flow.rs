@@ -38,7 +38,8 @@ fn copy_plan_and_execution_report_failures_and_successes() {
 
     assert_eq!(plan.files.len(), 2);
 
-    let summary = execute_copy(&plan, |_| {}).unwrap();
+    let summary = execute_copy(&plan, |_| {}, || false).unwrap();
     assert_eq!(summary.copied_files, 2);
     assert!(summary.failures.is_empty());
+    assert!(!summary.was_cancelled);
 }

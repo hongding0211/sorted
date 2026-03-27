@@ -2,7 +2,11 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -19,7 +23,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use sysinfo::Disks;
 
@@ -33,14 +37,11 @@ use crate::{
     platform::discovery::{DeviceDiscovery, SystemDeviceDiscovery, validate_selected_device},
 };
 
-const GLOBAL_HELP_TEXT: &str = "Ctrl+Q quit | Ctrl+R refresh | Ctrl+S settings";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Main,
     Settings,
     Confirmation,
-    Copying,
     CopyResults,
 }
 
@@ -175,12 +176,13 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
+    let status_height = if app.is_copy_active() { 6 } else { 4 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(4),
+            Constraint::Length(status_height),
             Constraint::Length(4),
         ])
         .split(frame.area());
@@ -197,26 +199,10 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::Main => draw_main(frame, app, layout[1]),
         Screen::Settings => draw_settings(frame, app, layout[1]),
         Screen::Confirmation => draw_confirmation(frame, app, layout[1]),
-        Screen::Copying => draw_copying(frame, app, layout[1]),
         Screen::CopyResults => draw_results(frame, app, layout[1]),
     }
 
-    let status = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{} ", app.status_message.kind.icon()),
-                semantic_style(app.status_message.kind).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.status_message.text.clone()),
-        ]),
-        Line::from(Span::styled(
-            "Transient app feedback appears here while richer guidance stays inside each screen.",
-            helper_style(),
-        )),
-    ])
-    .block(panel_block("Status", false).border_style(semantic_style(app.status_message.kind)))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(status, layout[2]);
+    draw_status(frame, app, layout[2]);
 
     let keyboard = Paragraph::new(app.keyboard_help_lines())
         .block(panel_block("Keyboard", false))
@@ -517,44 +503,60 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
-fn draw_copying(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let progress_line = match &app.copy_progress {
-        Some(progress) => format!(
-            "Copied {}/{} files{}",
-            progress.copied_files,
-            progress.total_files,
-            progress
-                .current_file
-                .as_ref()
-                .map(|path| format!(" | {}", path.display()))
-                .unwrap_or_default()
-        ),
-        None => "Preparing copy job...".to_string(),
-    };
+fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let block = panel_block("Status", false).border_style(semantic_style(app.status_message.kind));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let widget = Paragraph::new(vec![
-        Line::from(vec![Span::styled(
-            "Archive import in progress",
-            title_style(),
-        )]),
-        Line::from(Span::styled(
-            "The copy is active. Progress updates stay visible here until the job finishes.",
-            helper_style(),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Progress: ", label_style()),
-            Span::raw(format!("{} {progress_line}", app.loading_glyph())),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Leave is disabled while media is being copied.",
-            semantic_style(StatusKind::Warning),
-        )),
-    ])
-    .block(panel_block("Copy Progress", true))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(widget, area);
+    if app.is_copy_active() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(inner);
+
+        let message = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{} ", app.status_message.kind.icon()),
+                semantic_style(app.status_message.kind).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.status_message.text.clone()),
+        ]))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(message, rows[0]);
+
+        let gauge = Gauge::default()
+            .gauge_style(semantic_style(StatusKind::Info).add_modifier(Modifier::BOLD))
+            .ratio(copy_progress_ratio(app.copy_progress.as_ref()))
+            .label(copy_progress_summary(app.copy_progress.as_ref()));
+        frame.render_widget(gauge, rows[1]);
+
+        let current = Paragraph::new(Line::from(vec![
+            Span::styled("Current: ", helper_style()),
+            Span::raw(copy_progress_current_file(app.copy_progress.as_ref())),
+        ]))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(current, rows[2]);
+    } else {
+        let status = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", app.status_message.kind.icon()),
+                    semantic_style(app.status_message.kind).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(app.status_message.text.clone()),
+            ]),
+            Line::from(Span::styled(
+                "Transient app feedback appears here while richer guidance stays inside each screen.",
+                helper_style(),
+            )),
+        ])
+        .wrap(Wrap { trim: true });
+        frame.render_widget(status, inner);
+    }
 }
 
 fn field_style(app: &App, field: FocusField) -> Style {
@@ -596,6 +598,7 @@ struct App {
     copy_progress: Option<CopyProgress>,
     copy_result: Option<CopySummary>,
     copy_updates: Option<Receiver<CopyUpdate>>,
+    copy_cancel: Option<Arc<AtomicBool>>,
     background_updates: Receiver<BackgroundUpdate>,
     background_sender: Sender<BackgroundUpdate>,
     animation_started_at: Instant,
@@ -628,6 +631,7 @@ impl App {
             copy_progress: None,
             copy_result: None,
             copy_updates: None,
+            copy_cancel: None,
             background_updates,
             background_sender,
             animation_started_at: Instant::now(),
@@ -644,7 +648,17 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    if self.is_copy_active() {
+                        if let Some(cancel) = &self.copy_cancel {
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                        self.status_message =
+                            StatusMessage::warning("Stopping copy after the current file...");
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
                 KeyCode::Char('r') | KeyCode::Char('R') => self.request_device_refresh(),
                 KeyCode::Char('s') | KeyCode::Char('S') => self.open_settings(),
                 _ => {}
@@ -671,7 +685,7 @@ impl App {
     }
 
     fn open_settings(&mut self) {
-        if self.screen == Screen::Copying {
+        if self.is_copy_active() {
             self.status_message = StatusMessage::warning(
                 "Copy is running. Wait for it to finish before opening settings.",
             );
@@ -683,6 +697,12 @@ impl App {
     }
 
     fn request_device_refresh(&mut self) {
+        if self.is_copy_active() {
+            self.status_message = StatusMessage::warning(
+                "Copy is running. Wait for it to finish before refreshing devices.",
+            );
+            return;
+        }
         self.devices_loading = true;
         self.status_message = StatusMessage::info("Refreshing devices in the background...");
         let sender = self.background_sender.clone();
@@ -695,12 +715,10 @@ impl App {
 
     fn cycle_focus(&mut self) {
         self.focus = match self.screen {
-            Screen::Main | Screen::Confirmation | Screen::Copying | Screen::CopyResults => {
-                match self.focus {
-                    FocusField::SourceTree => FocusField::Theme,
-                    _ => FocusField::SourceTree,
-                }
-            }
+            Screen::Main | Screen::Confirmation | Screen::CopyResults => match self.focus {
+                FocusField::SourceTree => FocusField::Theme,
+                _ => FocusField::SourceTree,
+            },
             Screen::Settings => match self.focus {
                 FocusField::DestinationRoot => FocusField::DateFormat,
                 _ => FocusField::DestinationRoot,
@@ -754,6 +772,12 @@ impl App {
     }
 
     fn confirm_or_advance(&mut self) -> Result<()> {
+        if self.is_copy_active() && self.screen != Screen::CopyResults {
+            self.status_message =
+                StatusMessage::warning("Copy already in progress. Wait for it to stop first.");
+            return Ok(());
+        }
+
         match self.screen {
             Screen::Main => {
                 let selected_device = self
@@ -805,7 +829,6 @@ impl App {
                 }
             }
             Screen::Confirmation => self.start_copy()?,
-            Screen::Copying => {}
             Screen::CopyResults => {
                 self.screen = Screen::Main;
                 self.status_message = StatusMessage::info("Returned to import screen.");
@@ -821,11 +844,6 @@ impl App {
                 self.screen = Screen::Main;
                 self.focus = FocusField::SourceTree;
                 self.status_message = StatusMessage::info("Returned to import screen.");
-            }
-            Screen::Copying => {
-                self.status_message = StatusMessage::warning(
-                    "Copy is running. Wait for it to finish before leaving this screen.",
-                );
             }
         }
     }
@@ -918,15 +936,22 @@ impl App {
             current_file: None,
         });
         self.copy_result = None;
-        self.screen = Screen::Copying;
+        self.screen = Screen::Main;
+        self.focus = FocusField::SourceTree;
         let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         self.copy_updates = Some(receiver);
+        self.copy_cancel = Some(cancel.clone());
 
         thread::spawn(move || {
             let sender_for_progress = sender.clone();
-            let result = execute_copy(&plan, move |progress| {
-                let _ = sender_for_progress.send(CopyUpdate::Progress(progress));
-            });
+            let result = execute_copy(
+                &plan,
+                move |progress| {
+                    let _ = sender_for_progress.send(CopyUpdate::Progress(progress));
+                },
+                move || cancel.load(Ordering::SeqCst),
+            );
             let _ = sender.send(CopyUpdate::Finished(result));
         });
         Ok(())
@@ -983,10 +1008,14 @@ impl App {
                 match update {
                     CopyUpdate::Progress(progress) => {
                         self.copy_progress = Some(progress.clone());
-                        self.status_message = StatusMessage::info(format!(
-                            "Copying media files: {}/{} complete",
-                            progress.copied_files, progress.total_files
-                        ));
+                        self.status_message = if self.is_cancel_requested() {
+                            StatusMessage::warning("Stopping copy after the current file...")
+                        } else {
+                            StatusMessage::info(format!(
+                                "Copying media files: {}/{} complete",
+                                progress.copied_files, progress.total_files
+                            ))
+                        };
                     }
                     CopyUpdate::Finished(result) => finished = Some(result),
                 }
@@ -995,11 +1024,18 @@ impl App {
 
         if let Some(result) = finished {
             self.copy_updates = None;
+            self.copy_cancel = None;
             match result {
                 Ok(summary) => {
                     self.copy_result = Some(summary.clone());
-                    self.screen = Screen::CopyResults;
-                    self.status_message = if summary.failures.is_empty() {
+                    self.screen = Screen::Main;
+                    self.copy_progress = None;
+                    self.status_message = if summary.was_cancelled {
+                        StatusMessage::warning(format!(
+                            "Copy interrupted after {} file(s).",
+                            summary.copied_files
+                        ))
+                    } else if summary.failures.is_empty() {
                         StatusMessage::success(format!(
                             "Copy finished: {} file(s) archived.",
                             summary.copied_files
@@ -1013,6 +1049,7 @@ impl App {
                 }
                 Err(error) => {
                     self.copy_result = None;
+                    self.copy_progress = None;
                     self.screen = Screen::Main;
                     self.status_message = StatusMessage::error(format!("Copy failed: {error}"));
                 }
@@ -1112,12 +1149,22 @@ impl App {
         self.import_session.selected_device.clone()
     }
 
+    fn is_copy_active(&self) -> bool {
+        self.copy_updates.is_some()
+    }
+
+    fn is_cancel_requested(&self) -> bool {
+        self.copy_cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+    }
+
     fn keyboard_help_lines(&self) -> Vec<Line<'static>> {
         let context = contextual_help(self.screen, self.focus);
         vec![
             Line::from(vec![
                 Span::styled("Global: ", helper_style()),
-                Span::raw(GLOBAL_HELP_TEXT),
+                Span::raw(global_help_text(self.screen)),
             ]),
             Line::from(vec![
                 Span::styled("Here: ", helper_style()),
@@ -1428,10 +1475,41 @@ fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
         Screen::Confirmation => {
             "Enter starts the copy | Esc cancels and returns to the archive screen"
         }
-        Screen::Copying => {
-            "Wait for the copy to finish. Navigation away from this screen is disabled."
-        }
         Screen::CopyResults => "Enter or Esc returns to the archive screen",
+    }
+}
+
+fn global_help_text(_screen: Screen) -> &'static str {
+    "Ctrl+Q quit | Ctrl+R refresh | Ctrl+S settings"
+}
+
+fn copy_progress_ratio(progress: Option<&CopyProgress>) -> f64 {
+    let Some(progress) = progress else {
+        return 0.0;
+    };
+
+    if progress.total_files == 0 {
+        0.0
+    } else {
+        progress.copied_files as f64 / progress.total_files as f64
+    }
+}
+
+fn copy_progress_summary(progress: Option<&CopyProgress>) -> String {
+    match progress {
+        Some(progress) if progress.total_files > 0 => format!(
+            "{} of {} files copied",
+            progress.copied_files, progress.total_files
+        ),
+        Some(_) => "Preparing copy job...".to_string(),
+        None => "Preparing copy job...".to_string(),
+    }
+}
+
+fn copy_progress_current_file(progress: Option<&CopyProgress>) -> String {
+    match progress.and_then(|progress| progress.current_file.as_ref()) {
+        Some(path) => path.display().to_string(),
+        None => "Preparing copy job...".to_string(),
     }
 }
 
@@ -1566,6 +1644,7 @@ mod tests {
             copy_progress: None,
             copy_result: None,
             copy_updates: None,
+            copy_cancel: None,
             background_updates,
             background_sender,
             animation_started_at: Instant::now(),
@@ -1582,6 +1661,57 @@ mod tests {
         assert!(
             contextual_help(Screen::CopyResults, FocusField::SourceTree).contains("Enter or Esc")
         );
+        assert!(
+            contextual_help(Screen::Confirmation, FocusField::SourceTree).contains("Enter starts")
+        );
+    }
+
+    #[test]
+    fn copy_progress_helpers_report_ratio_and_text() {
+        let progress = CopyProgress {
+            copied_files: 3,
+            total_files: 5,
+            current_file: Some(PathBuf::from("/tmp/media/frame.cr3")),
+        };
+
+        assert_eq!(copy_progress_ratio(Some(&progress)), 0.6);
+        assert_eq!(
+            copy_progress_summary(Some(&progress)),
+            "3 of 5 files copied"
+        );
+        assert_eq!(
+            copy_progress_current_file(Some(&progress)),
+            "/tmp/media/frame.cr3"
+        );
+    }
+
+    #[test]
+    fn ctrl_q_quits_when_copy_is_not_active() {
+        let mut app = test_app();
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert!(should_quit);
+    }
+
+    #[test]
+    fn ctrl_q_requests_copy_stop_while_copy_is_active() {
+        let mut app = test_app();
+        let (_sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.copy_updates = Some(receiver);
+        app.copy_cancel = Some(cancel.clone());
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.status_message.kind, StatusKind::Warning);
+        assert!(cancel.load(Ordering::SeqCst));
+        assert!(app.status_message.text.contains("Stopping copy"));
     }
 
     #[test]
