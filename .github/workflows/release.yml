@@ -111,6 +111,8 @@ jobs:
       - name: Create checksum manifest
         shell: bash
         run: |
+          cp scripts/install.sh dist/sorted-install.sh
+
           python3 - <<'PY'
           import hashlib
           from pathlib import Path

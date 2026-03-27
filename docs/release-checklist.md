@@ -23,7 +23,8 @@ Use this checklist before creating the first public GitHub Release for Sorted.
    - `sorted-v0.1.0-x86_64-pc-windows-msvc.zip`
    - `sorted-v0.1.0-x86_64-apple-darwin.tar.gz`
    - `sorted-v0.1.0-aarch64-apple-darwin.tar.gz`
+   - `sorted-install.sh`
    - `sorted-checksums.txt`
 5. Test the installer on macOS or Linux:
-   `curl -fsSL https://raw.githubusercontent.com/hongding0211/sorted/main/scripts/install.sh | sh`
+   `curl -fsSL https://github.com/hongding0211/sorted/releases/latest/download/sorted-install.sh | sh`
 6. If a release asset is missing or malformed, delete the GitHub Release, fix the workflow, and publish the tag again.

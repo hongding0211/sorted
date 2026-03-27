@@ -34,19 +34,19 @@ cargo test
 Install the latest GitHub Release on macOS or Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hongding0211/sorted/main/scripts/install.sh | sh
+curl -fsSL https://github.com/hongding0211/sorted/releases/latest/download/sorted-install.sh | sh
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hongding0211/sorted/main/scripts/install.sh | sh -s -- v0.1.0
+curl -fsSL https://github.com/hongding0211/sorted/releases/download/v0.1.0/sorted-install.sh | sh -s -- v0.1.0
 ```
 
 Override the install directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hongding0211/sorted/main/scripts/install.sh | SORTED_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://github.com/hongding0211/sorted/releases/latest/download/sorted-install.sh | SORTED_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Windows users should download the latest `.zip` package directly from [GitHub Releases](https://github.com/hongding0211/sorted/releases).
@@ -69,7 +69,13 @@ git push origin v0.1.0
 
 You can also trigger the `Release` workflow manually in GitHub and provide a version tag such as `v0.1.0`.
 
-Each release uploads platform-specific archives plus `sorted-checksums.txt`. See [docs/release-checklist.md](docs/release-checklist.md) for the first-release validation checklist.
+Each release uploads:
+
+- platform-specific compiled archives
+- `sorted-install.sh`
+- `sorted-checksums.txt`
+
+See [docs/release-checklist.md](docs/release-checklist.md) for the first-release validation checklist.
 
 ### Cargo Release
 
