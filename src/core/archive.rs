@@ -14,7 +14,7 @@ pub fn build_archive_plan(
     device: &DeviceInfo,
     now: DateTime<Local>,
 ) -> Result<ArchivePlan> {
-    validate_destination_root(&settings.destination_root)?;
+    let destination_root = validate_destination_root(&settings.destination_root)?;
     validate_date_format(&settings.date_format)?;
 
     if !device.is_available() {
@@ -38,16 +38,15 @@ pub fn build_archive_plan(
     }
 
     let date_segment = now.format(&settings.date_format).to_string();
-    let archive_root = settings
-        .destination_root
-        .join(format!("{normalized_theme}{date_segment}"))
+    let archive_root = destination_root
+        .join(format!("{normalized_theme}_{date_segment}"))
         .join(&normalized_device);
 
     Ok(ArchivePlan {
         theme_segment: normalized_theme,
         date_segment,
         device_segment: normalized_device,
-        destination_root: settings.destination_root.clone(),
+        destination_root,
         archive_root,
     })
 }
@@ -132,7 +131,50 @@ mod tests {
 
         assert_eq!(
             plan.archive_root,
-            root.path().join("xxx_travel2026-03-27").join("EOS_R6")
+            root.path().join("xxx_travel_2026-03-27").join("EOS_R6")
+        );
+    }
+
+    #[test]
+    fn resolves_tilde_destination_root_in_archive_plan() {
+        let home = directories::UserDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
+        let mount_root = tempdir().unwrap();
+        let suffix = format!(
+            "sorted-archive-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let settings = ArchiveSettings {
+            destination_root: PathBuf::from(format!("~/{suffix}")),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: mount_root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = build_archive_plan(
+            &settings,
+            "xxx travel",
+            &device,
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.destination_root, home.join(&suffix));
+        assert_eq!(
+            plan.archive_root,
+            home.join(&suffix)
+                .join("xxx_travel_2026-03-27")
+                .join("EOS_R6")
         );
     }
 }

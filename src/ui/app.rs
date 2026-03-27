@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -21,18 +21,19 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use sysinfo::Disks;
 
 use crate::{
     core::{
         archive::{build_archive_plan, destination_preview},
-        config::{ConfigStore, validate_date_format, validate_destination_root},
-        copy::{CopyProgress, CopySummary, execute_copy, plan_copy},
+        config::{ConfigStore, resolve_destination_root, validate_date_format, validate_settings},
+        copy::{CopyProgress, CopySummary, discover_media_files, execute_copy, plan_copy},
         types::{ArchiveSettings, DeviceAvailability, DeviceInfo, ImportSession},
     },
     platform::discovery::{DeviceDiscovery, SystemDeviceDiscovery, validate_selected_device},
 };
 
-const HELP_TEXT: &str = "Ctrl+Q quit | Ctrl+R refresh | Ctrl+S settings | arrows move | Left/Right collapse-expand | Tab cycle focus | Enter confirm/save | Esc back";
+const GLOBAL_HELP_TEXT: &str = "Ctrl+Q quit | Ctrl+R refresh | Ctrl+S settings";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -51,6 +52,61 @@ enum FocusField {
     DateFormat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl StatusKind {
+    fn icon(self) -> &'static str {
+        match self {
+            StatusKind::Info => "◎",
+            StatusKind::Success => "●",
+            StatusKind::Warning => "▲",
+            StatusKind::Error => "✕",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StatusMessage {
+    kind: StatusKind,
+    text: String,
+}
+
+impl StatusMessage {
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            kind: StatusKind::Info,
+            text: text.into(),
+        }
+    }
+
+    fn success(text: impl Into<String>) -> Self {
+        Self {
+            kind: StatusKind::Success,
+            text: text.into(),
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            kind: StatusKind::Warning,
+            text: text.into(),
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            kind: StatusKind::Error,
+            text: text.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SourceEntry {
     device_id: String,
@@ -61,6 +117,21 @@ struct SourceEntry {
     has_children: bool,
     is_loading: bool,
     is_device_root: bool,
+    is_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSummary {
+    file_count: usize,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AsyncValue<T> {
+    Idle,
+    Loading,
+    Ready(T),
+    Error(String),
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +167,8 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 break;
             }
         }
+
+        app.advance_animation();
     }
 
     Ok(())
@@ -107,13 +180,17 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
-    let title =
-        Paragraph::new("Sorted").block(Block::default().title("Sorted").borders(Borders::ALL));
+    let title = Paragraph::new(vec![Line::from(vec![Span::styled(
+        "Archive anything, stay sorted",
+        helper_style(),
+    )])])
+    .block(panel_block("Sorted", false))
+    .wrap(Wrap { trim: true });
     frame.render_widget(title, layout[0]);
 
     match app.screen {
@@ -124,13 +201,25 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::CopyResults => draw_results(frame, app, layout[1]),
     }
 
-    let status = Paragraph::new(app.status_message.clone())
-        .block(Block::default().title("Status").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
+    let status = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", app.status_message.kind.icon()),
+                semantic_style(app.status_message.kind).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.status_message.text.clone()),
+        ]),
+        Line::from(Span::styled(
+            "Transient app feedback appears here while richer guidance stays inside each screen.",
+            helper_style(),
+        )),
+    ])
+    .block(panel_block("Status", false).border_style(semantic_style(app.status_message.kind)))
+    .wrap(Wrap { trim: true });
     frame.render_widget(status, layout[2]);
 
-    let keyboard = Paragraph::new(HELP_TEXT)
-        .block(Block::default().title("Keyboard").borders(Borders::ALL))
+    let keyboard = Paragraph::new(app.keyboard_help_lines())
+        .block(panel_block("Keyboard", false))
         .wrap(Wrap { trim: true });
     frame.render_widget(keyboard, layout[3]);
 }
@@ -138,7 +227,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 fn draw_main(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
 
     draw_source_tree(frame, app, columns[0]);
@@ -147,11 +236,29 @@ fn draw_main(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_source_tree(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let items = if app.source_entries.is_empty() {
-        vec![ListItem::new(if app.devices_loading {
-            "Scanning devices..."
+        if app.devices_loading {
+            vec![
+                ListItem::new(Line::from(vec![Span::styled(
+                    format!("{} Scanning removable devices...", app.loading_glyph()),
+                    helper_style(),
+                )])),
+                ListItem::new(Line::from(vec![Span::styled(
+                    "Browse will update automatically when discovery finishes.",
+                    helper_style(),
+                )])),
+            ]
         } else {
-            "No removable devices found"
-        })]
+            vec![
+                ListItem::new(Line::from(vec![Span::styled(
+                    "No removable devices found.",
+                    semantic_style(StatusKind::Warning),
+                )])),
+                ListItem::new(Line::from(vec![Span::styled(
+                    "Connect media, then refresh to scan again.",
+                    helper_style(),
+                )])),
+            ]
+        }
     } else {
         app.source_entries
             .iter()
@@ -162,14 +269,18 @@ fn draw_source_tree(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     "•"
                 };
-                let loading = if entry.is_loading { " (loading)" } else { "" };
+                let loading = if entry.is_loading {
+                    format!("  {}", app.loading_glyph())
+                } else {
+                    String::new()
+                };
                 let indent = "  ".repeat(entry.depth);
                 let style = if index == app.source_index && app.focus == FocusField::SourceTree {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                    focus_style()
+                } else if entry.is_device_root && !entry.is_available {
+                    semantic_style(StatusKind::Warning).add_modifier(Modifier::BOLD)
                 } else if entry.is_device_root {
-                    Style::default().add_modifier(Modifier::BOLD)
+                    label_style()
                 } else {
                     Style::default()
                 };
@@ -178,82 +289,76 @@ fn draw_source_tree(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .collect()
     };
 
-    let widget = List::new(items).block(
-        Block::default()
-            .title("Source")
-            .borders(Borders::ALL)
-            .border_style(if app.focus == FocusField::SourceTree {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            }),
-    );
+    let widget = List::new(items).block(panel_block(
+        "Source Browser",
+        app.focus == FocusField::SourceTree,
+    ));
     frame.render_widget(widget, area);
 }
 
 fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let preview = app
-        .preview_path()
-        .unwrap_or_else(|| "Archive path preview unavailable".to_string());
-    let source = app
-        .selected_source()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "No source folder selected".to_string());
+    let preview = app.preview_path();
+    let theme = if app.import_session.theme.trim().is_empty() {
+        None
+    } else {
+        Some(app.import_session.theme.clone())
+    };
 
     let content = Paragraph::new(vec![
+        Line::from(vec![Span::styled("THEME", section_style())]),
         Line::from(vec![
-            Span::styled("Theme: ", field_style(app, FocusField::Theme)),
-            Span::raw(&app.import_session.theme),
+            Span::styled("  ", helper_style()),
+            match theme {
+                Some(ref value) => Span::styled(value.clone(), field_style(app, FocusField::Theme)),
+                None => Span::raw(""),
+            },
         ]),
         Line::from(""),
+        Line::from(vec![Span::styled("TARGET", section_style())]),
         Line::from(vec![
-            Span::styled(
-                "Source Folder: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(source),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Destination: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.settings.destination_root.display().to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Date Format: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(&app.settings.date_format),
+            Span::styled("  ", helper_style()),
+            match preview {
+                Some(value) => Span::styled(value, highlight_style()),
+                None => Span::raw("N/A"),
+            },
         ]),
         Line::from(""),
+        Line::from(vec![Span::styled("CAPACITY", section_style())]),
         Line::from(vec![
-            Span::styled("Preview: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(preview),
+            Span::styled("  Selected", label_style()),
+            Span::styled("  ", helper_style()),
+            source_summary_span(app),
+        ]),
+        Line::from(vec![
+            Span::styled("  Free Space", label_style()),
+            Span::styled("  ", helper_style()),
+            destination_space_span(app),
         ]),
     ])
-    .block(
-        Block::default()
-            .title("Target")
-            .borders(Borders::ALL)
-            .border_style(if app.focus == FocusField::Theme {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            }),
-    )
+    .block(panel_block(
+        "Archive Target",
+        app.focus == FocusField::Theme,
+    ))
     .wrap(Wrap { trim: true });
     frame.render_widget(content, area);
 }
 
 fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    let feedback = app.settings_feedback();
     let preview = validate_date_format(&app.settings.date_format)
         .map(|date| date.preview)
-        .unwrap_or_else(|error| format!("invalid: {error}"));
+        .unwrap_or_else(|_| "Preview unavailable until the format is valid.".to_string());
 
-    let content = Paragraph::new(vec![
-        Line::from("Edit settings in-place: typed input is applied to the focused field."),
+    let fields = Paragraph::new(vec![
+        Line::from(vec![Span::styled("Settings", title_style())]),
+        Line::from(Span::styled(
+            "Edit values in-place. The active field is highlighted so you always know where typing goes.",
+            helper_style(),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -262,20 +367,46 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::raw(app.settings.destination_root.display().to_string()),
         ]),
+        Line::from(Span::styled(
+            "Used as the writable base directory for each archive session.",
+            helper_style(),
+        )),
+        Line::from(""),
         Line::from(vec![
             Span::styled("Date Format: ", field_style(app, FocusField::DateFormat)),
             Span::raw(app.settings.date_format.clone()),
         ]),
+        Line::from(Span::styled(
+            "Controls the date segment rendered inside destination folder names.",
+            helper_style(),
+        )),
+    ])
+    .block(panel_block("Archive Preferences", true))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(fields, panels[0]);
+
+    let feedback_panel = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Preview: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("Preview: ", label_style()),
             Span::raw(preview),
         ]),
         Line::from(""),
-        Line::from("Press enter to save settings or esc to return."),
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", feedback.kind.icon()),
+                semantic_style(feedback.kind).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(feedback.text),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter saves these values. Esc returns without saving the current edits.",
+            helper_style(),
+        )),
     ])
-    .block(Block::default().title("Settings").borders(Borders::ALL))
+    .block(panel_block("Validation", false).border_style(semantic_style(feedback.kind)))
     .wrap(Wrap { trim: true });
-    frame.render_widget(content, area);
+    frame.render_widget(feedback_panel, panels[1]);
 }
 
 fn draw_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -288,14 +419,35 @@ fn draw_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No source folder selected".to_string());
     let modal = Paragraph::new(vec![
-        Line::from("Confirm archive import"),
+        Line::from(vec![Span::styled("Ready to archive", title_style())]),
+        Line::from(Span::styled(
+            "Check the source and resolved destination one last time before the copy starts.",
+            helper_style(),
+        )),
         Line::from(""),
-        Line::from(format!("Source: {source}")),
-        Line::from(preview),
+        Line::from(vec![
+            Span::styled("Source Folder: ", label_style()),
+            Span::raw(source),
+        ]),
+        Line::from(vec![
+            Span::styled("Destination Preview: ", label_style()),
+            Span::raw(preview),
+        ]),
+        Line::from(vec![
+            Span::styled("Theme: ", label_style()),
+            Span::raw(if app.import_session.theme.trim().is_empty() {
+                "No theme entered"
+            } else {
+                &app.import_session.theme
+            }),
+        ]),
         Line::from(""),
-        Line::from("Press enter to start copy or esc to cancel."),
+        Line::from(Span::styled(
+            "Enter starts the copy. Esc returns to the archive screen.",
+            helper_style(),
+        )),
     ])
-    .block(Block::default().title("Confirmation").borders(Borders::ALL))
+    .block(panel_block("Confirmation", true))
     .wrap(Wrap { trim: true });
     frame.render_widget(modal, area);
 }
@@ -304,32 +456,63 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let result_text = match &app.copy_result {
         Some(result) => {
             let mut lines = vec![
-                Line::from(format!(
-                    "Copied {} files into {}",
-                    result.copied_files,
-                    result.destination.display()
-                )),
+                Line::from(vec![Span::styled(
+                    if result.failures.is_empty() {
+                        "Archive complete"
+                    } else {
+                        "Archive completed with issues"
+                    },
+                    title_style(),
+                )]),
+                Line::from(vec![
+                    Span::styled("Destination: ", label_style()),
+                    Span::raw(result.destination.display().to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Files copied: ", label_style()),
+                    Span::raw(result.copied_files.to_string()),
+                ]),
                 Line::from(""),
             ];
             if result.failures.is_empty() {
-                lines.push(Line::from("No copy failures reported."));
+                lines.push(Line::from(Span::styled(
+                    "No copy failures were reported.",
+                    semantic_style(StatusKind::Success),
+                )));
             } else {
-                lines.push(Line::from("Failures:"));
+                lines.push(Line::from(Span::styled(
+                    "Failures",
+                    semantic_style(StatusKind::Warning).add_modifier(Modifier::BOLD),
+                )));
                 for failure in &result.failures {
                     lines.push(Line::from(format!(
-                        "{}: {}",
+                        "- {}: {}",
                         failure.file.display(),
                         failure.error
                     )));
                 }
             }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Press Enter or Esc to return to the main archive screen.",
+                helper_style(),
+            )));
             lines
         }
-        None => vec![Line::from("No copy has been run yet.")],
+        None => vec![
+            Line::from(vec![Span::styled(
+                "No copy has been run yet.",
+                helper_style(),
+            )]),
+            Line::from(Span::styled(
+                "Start an import from the main screen to populate results here.",
+                helper_style(),
+            )),
+        ],
     };
 
     let widget = Paragraph::new(result_text)
-        .block(Block::default().title("Copy Results").borders(Borders::ALL))
+        .block(panel_block("Copy Results", true))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
@@ -350,28 +533,35 @@ fn draw_copying(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
 
     let widget = Paragraph::new(vec![
-        Line::from("Archive import in progress"),
+        Line::from(vec![Span::styled(
+            "Archive import in progress",
+            title_style(),
+        )]),
+        Line::from(Span::styled(
+            "The copy is active. Progress updates stay visible here until the job finishes.",
+            helper_style(),
+        )),
         Line::from(""),
-        Line::from(progress_line),
+        Line::from(vec![
+            Span::styled("Progress: ", label_style()),
+            Span::raw(format!("{} {progress_line}", app.loading_glyph())),
+        ]),
         Line::from(""),
-        Line::from("Progress updates will stay visible here until the copy finishes."),
+        Line::from(Span::styled(
+            "Leave is disabled while media is being copied.",
+            semantic_style(StatusKind::Warning),
+        )),
     ])
-    .block(
-        Block::default()
-            .title("Copy Progress")
-            .borders(Borders::ALL),
-    )
+    .block(panel_block("Copy Progress", true))
     .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
 
 fn field_style(app: &App, field: FocusField) -> Style {
     if app.focus == field {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        focus_style()
     } else {
-        Style::default().add_modifier(Modifier::BOLD)
+        label_style()
     }
 }
 
@@ -400,7 +590,7 @@ struct App {
     source_entries: Vec<SourceEntry>,
     source_index: usize,
     import_session: ImportSession,
-    status_message: String,
+    status_message: StatusMessage,
     screen: Screen,
     focus: FocusField,
     copy_progress: Option<CopyProgress>,
@@ -408,6 +598,11 @@ struct App {
     copy_updates: Option<Receiver<CopyUpdate>>,
     background_updates: Receiver<BackgroundUpdate>,
     background_sender: Sender<BackgroundUpdate>,
+    animation_started_at: Instant,
+    source_summary: AsyncValue<SourceSummary>,
+    source_summary_path: Option<PathBuf>,
+    destination_free_space: AsyncValue<u64>,
+    destination_free_path: Option<PathBuf>,
 }
 
 impl App {
@@ -425,7 +620,9 @@ impl App {
             source_entries: Vec::new(),
             source_index: 0,
             import_session: ImportSession::default(),
-            status_message: "Starting up. Scanning devices in the background...".to_string(),
+            status_message: StatusMessage::info(
+                "Starting up. Scanning devices in the background...",
+            ),
             screen: Screen::Main,
             focus: FocusField::SourceTree,
             copy_progress: None,
@@ -433,8 +630,14 @@ impl App {
             copy_updates: None,
             background_updates,
             background_sender,
+            animation_started_at: Instant::now(),
+            source_summary: AsyncValue::Idle,
+            source_summary_path: None,
+            destination_free_space: AsyncValue::Idle,
+            destination_free_path: None,
         };
         app.request_device_refresh();
+        app.request_destination_free_space();
         Ok(app)
     }
 
@@ -469,18 +672,19 @@ impl App {
 
     fn open_settings(&mut self) {
         if self.screen == Screen::Copying {
-            self.status_message =
-                "Copy is running. Wait for it to finish before opening settings.".to_string();
+            self.status_message = StatusMessage::warning(
+                "Copy is running. Wait for it to finish before opening settings.",
+            );
         } else {
             self.screen = Screen::Settings;
             self.focus = FocusField::DestinationRoot;
-            self.status_message = "Editing persisted settings.".to_string();
+            self.status_message = StatusMessage::info("Editing persisted settings.");
         }
     }
 
     fn request_device_refresh(&mut self) {
         self.devices_loading = true;
-        self.status_message = "Refreshing devices in the background...".to_string();
+        self.status_message = StatusMessage::info("Refreshing devices in the background...");
         let sender = self.background_sender.clone();
         thread::spawn(move || {
             let discovery = SystemDeviceDiscovery;
@@ -561,39 +765,50 @@ impl App {
                     return Ok(());
                 }
                 let Some(source_root) = self.selected_source() else {
-                    self.status_message = "Pick a source folder before continuing.".to_string();
+                    self.status_message =
+                        StatusMessage::warning("Pick a source folder before continuing.");
                     return Ok(());
                 };
                 if matches!(
                     self.directory_state.get(&source_root),
                     Some(DirectoryLoadState::Loading)
                 ) {
-                    self.status_message =
-                        "That folder is still loading. Try again in a moment.".to_string();
+                    self.status_message = StatusMessage::warning(
+                        "That folder is still loading. Try again in a moment.",
+                    );
                     return Ok(());
                 }
                 self.import_session.selected_device = Some(selected_device);
                 self.screen = Screen::Confirmation;
-                self.status_message =
-                    "Review the source folder and archive destination before copy starts."
-                        .to_string();
+                self.status_message = StatusMessage::info(
+                    "Review the source folder and archive destination before copy starts.",
+                );
             }
             Screen::Settings => {
-                validate_destination_root(&self.settings.destination_root)?;
-                validate_date_format(&self.settings.date_format)?;
-                self.config_store.save(&self.settings)?;
-                self.screen = Screen::Main;
-                self.focus = FocusField::SourceTree;
-                self.status_message = format!(
-                    "Saved settings to {}",
-                    self.config_store.config_path().display()
-                );
+                match validate_settings(&self.settings).and_then(|(settings, _)| {
+                    self.config_store.save(&settings)?;
+                    Ok(settings)
+                }) {
+                    Ok(settings) => {
+                        self.settings = settings;
+                        self.screen = Screen::Main;
+                        self.focus = FocusField::SourceTree;
+                        self.status_message = StatusMessage::success(format!(
+                            "Saved settings to {}",
+                            self.config_store.config_path().display()
+                        ));
+                    }
+                    Err(error) => {
+                        self.status_message =
+                            StatusMessage::error(format!("Settings could not be saved: {error}"));
+                    }
+                }
             }
             Screen::Confirmation => self.start_copy()?,
             Screen::Copying => {}
             Screen::CopyResults => {
                 self.screen = Screen::Main;
-                self.status_message = "Returned to import screen.".to_string();
+                self.status_message = StatusMessage::info("Returned to import screen.");
             }
         }
         Ok(())
@@ -605,12 +820,12 @@ impl App {
             Screen::Settings | Screen::Confirmation | Screen::CopyResults => {
                 self.screen = Screen::Main;
                 self.focus = FocusField::SourceTree;
-                self.status_message = "Returned to import screen.".to_string();
+                self.status_message = StatusMessage::info("Returned to import screen.");
             }
             Screen::Copying => {
-                self.status_message =
-                    "Copy is running. Wait for it to finish before leaving this screen."
-                        .to_string();
+                self.status_message = StatusMessage::warning(
+                    "Copy is running. Wait for it to finish before leaving this screen.",
+                );
             }
         }
     }
@@ -623,6 +838,7 @@ impl App {
             FocusField::DestinationRoot if self.screen == Screen::Settings => {
                 let updated = trim_last_char(self.settings.destination_root.display().to_string());
                 self.settings.destination_root = updated.into();
+                self.request_destination_free_space();
             }
             FocusField::DateFormat if self.screen == Screen::Settings => {
                 self.settings.date_format.pop();
@@ -642,6 +858,7 @@ impl App {
                 let mut path = self.settings.destination_root.display().to_string();
                 path.push(ch);
                 self.settings.destination_root = path.into();
+                self.request_destination_free_space();
             }
             FocusField::DateFormat if self.screen == Screen::Settings => {
                 self.settings.date_format.push(ch)
@@ -673,7 +890,8 @@ impl App {
             return Ok(());
         }
         if self.import_session.theme.trim().is_empty() {
-            self.status_message = "Enter a theme before starting the import.".to_string();
+            self.status_message =
+                StatusMessage::warning("Enter a theme before starting the import.");
             self.screen = Screen::Main;
             self.focus = FocusField::Theme;
             return Ok(());
@@ -689,11 +907,11 @@ impl App {
             &source_root,
             Local::now(),
         )?;
-        self.status_message = format!(
+        self.status_message = StatusMessage::info(format!(
             "Copying {} media file(s) from {}",
             plan.files.len(),
             source_root.display()
-        );
+        ));
         self.copy_progress = Some(CopyProgress {
             copied_files: 0,
             total_files: plan.files.len(),
@@ -728,7 +946,8 @@ impl App {
                             self.source_entries.clear();
                             self.import_session.selected_device = None;
                             self.import_session.selected_source = None;
-                            self.status_message = format!("Device refresh failed: {error}");
+                            self.status_message =
+                                StatusMessage::error(format!("Device refresh failed: {error}"));
                         }
                     }
                 }
@@ -737,7 +956,23 @@ impl App {
                     self.directory_state
                         .insert(path.clone(), DirectoryLoadState::Loaded(children));
                     self.rebuild_source_entries();
-                    self.status_message = format!("Loaded {}", path.display());
+                    self.status_message = StatusMessage::info(format!("Loaded {}", path.display()));
+                }
+                BackgroundUpdate::SourceSummaryLoaded(path, result) => {
+                    if self.source_summary_path.as_ref() == Some(&path) {
+                        self.source_summary = match result {
+                            Ok(summary) => AsyncValue::Ready(summary),
+                            Err(error) => AsyncValue::Error(error),
+                        };
+                    }
+                }
+                BackgroundUpdate::DestinationFreeSpaceLoaded(path, result) => {
+                    if self.destination_free_path.as_ref() == Some(&path) {
+                        self.destination_free_space = match result {
+                            Ok(bytes) => AsyncValue::Ready(bytes),
+                            Err(error) => AsyncValue::Error(error),
+                        };
+                    }
                 }
             }
         }
@@ -748,10 +983,10 @@ impl App {
                 match update {
                     CopyUpdate::Progress(progress) => {
                         self.copy_progress = Some(progress.clone());
-                        self.status_message = format!(
+                        self.status_message = StatusMessage::info(format!(
                             "Copying media files: {}/{} complete",
                             progress.copied_files, progress.total_files
-                        );
+                        ));
                     }
                     CopyUpdate::Finished(result) => finished = Some(result),
                 }
@@ -765,15 +1000,21 @@ impl App {
                     self.copy_result = Some(summary.clone());
                     self.screen = Screen::CopyResults;
                     self.status_message = if summary.failures.is_empty() {
-                        format!("Copy finished: {} file(s) archived.", summary.copied_files)
+                        StatusMessage::success(format!(
+                            "Copy finished: {} file(s) archived.",
+                            summary.copied_files
+                        ))
                     } else {
-                        format!("Copy completed with {} failure(s).", summary.failures.len())
+                        StatusMessage::warning(format!(
+                            "Copy completed with {} failure(s).",
+                            summary.failures.len()
+                        ))
                     };
                 }
                 Err(error) => {
                     self.copy_result = None;
                     self.screen = Screen::Main;
-                    self.status_message = format!("Copy failed: {error}");
+                    self.status_message = StatusMessage::error(format!("Copy failed: {error}"));
                 }
             }
         }
@@ -789,6 +1030,8 @@ impl App {
         self.source_index = 0;
         self.import_session.selected_device = None;
         self.import_session.selected_source = None;
+        self.source_summary = AsyncValue::Idle;
+        self.source_summary_path = None;
 
         for device in &self.devices {
             self.directory_state
@@ -810,11 +1053,15 @@ impl App {
             }
         }
         self.sync_selection_from_index();
+        if self.source_entries.is_empty() {
+            self.source_summary = AsyncValue::Idle;
+            self.source_summary_path = None;
+        }
 
         self.status_message = if self.devices.is_empty() {
-            "No removable devices found.".to_string()
+            StatusMessage::warning("No removable devices found.")
         } else {
-            format!("Found {} removable device(s).", self.devices.len())
+            StatusMessage::success(format!("Found {} removable device(s).", self.devices.len()))
         };
     }
 
@@ -853,6 +1100,7 @@ impl App {
                 .iter()
                 .find(|device| device.id == entry.device_id)
                 .cloned();
+            self.request_source_summary(entry.path.clone());
         }
     }
 
@@ -863,11 +1111,94 @@ impl App {
     fn selected_device(&self) -> Option<DeviceInfo> {
         self.import_session.selected_device.clone()
     }
+
+    fn keyboard_help_lines(&self) -> Vec<Line<'static>> {
+        let context = contextual_help(self.screen, self.focus);
+        vec![
+            Line::from(vec![
+                Span::styled("Global: ", helper_style()),
+                Span::raw(GLOBAL_HELP_TEXT),
+            ]),
+            Line::from(vec![
+                Span::styled("Here: ", helper_style()),
+                Span::raw(context),
+            ]),
+        ]
+    }
+
+    fn settings_feedback(&self) -> StatusMessage {
+        match validate_settings(&self.settings) {
+            Ok((resolved, preview)) => StatusMessage::success(format!(
+                "Ready to save. Destination resolves to {} and renders dates like {}.",
+                resolved.destination_root.display(),
+                preview.preview
+            )),
+            Err(error) => StatusMessage::error(format!("Fix this before saving: {error}")),
+        }
+    }
+
+    fn advance_animation(&mut self) {
+        let _ = self.animation_started_at.elapsed();
+    }
+
+    fn loading_glyph(&self) -> &'static str {
+        const FRAMES: &[&str] = &["◜", "◠", "◝", "◞", "◡", "◟"];
+        let frame = (self.animation_started_at.elapsed().as_millis() / 120) as usize;
+        FRAMES[frame % FRAMES.len()]
+    }
+
+    fn request_source_summary(&mut self, path: PathBuf) {
+        if self.source_summary_path.as_ref() == Some(&path)
+            && matches!(
+                self.source_summary,
+                AsyncValue::Loading | AsyncValue::Ready(_)
+            )
+        {
+            return;
+        }
+
+        self.source_summary_path = Some(path.clone());
+        self.source_summary = AsyncValue::Loading;
+        let sender = self.background_sender.clone();
+        thread::spawn(move || {
+            let result = summarize_source_root(&path).map_err(|error| error.to_string());
+            let _ = sender.send(BackgroundUpdate::SourceSummaryLoaded(path, result));
+        });
+    }
+
+    fn request_destination_free_space(&mut self) {
+        let Ok(path) = resolve_destination_root(&self.settings.destination_root) else {
+            self.destination_free_path = None;
+            self.destination_free_space = AsyncValue::Error(
+                "Free space appears after the destination path is valid.".to_string(),
+            );
+            return;
+        };
+
+        if self.destination_free_path.as_ref() == Some(&path)
+            && matches!(
+                self.destination_free_space,
+                AsyncValue::Loading | AsyncValue::Ready(_)
+            )
+        {
+            return;
+        }
+
+        self.destination_free_path = Some(path.clone());
+        self.destination_free_space = AsyncValue::Loading;
+        let sender = self.background_sender.clone();
+        thread::spawn(move || {
+            let result = available_space_for_destination(&path).map_err(|error| error.to_string());
+            let _ = sender.send(BackgroundUpdate::DestinationFreeSpaceLoaded(path, result));
+        });
+    }
 }
 
 enum BackgroundUpdate {
     DevicesLoaded(Result<Vec<DeviceInfo>>),
     DirectoryLoaded(PathBuf, Vec<PathBuf>),
+    SourceSummaryLoaded(PathBuf, Result<SourceSummary, String>),
+    DestinationFreeSpaceLoaded(PathBuf, Result<u64, String>),
 }
 
 enum CopyUpdate {
@@ -893,19 +1224,13 @@ fn flatten_source_tree(
     entries.push(SourceEntry {
         device_id: device.id.clone(),
         path: path.clone(),
-        label: format!(
-            "{} ({})",
-            device.display_name,
-            match &device.availability {
-                DeviceAvailability::Available => "ready",
-                DeviceAvailability::Unavailable(_) => "unavailable",
-            }
-        ),
+        label: device.display_name.clone(),
         depth,
         is_expanded,
         has_children,
         is_loading,
         is_device_root: true,
+        is_available: device.is_available(),
     });
 
     if !is_expanded {
@@ -954,6 +1279,7 @@ fn flatten_directory_entry(
         has_children,
         is_loading,
         is_device_root: false,
+        is_available: true,
     });
 
     if !is_expanded {
@@ -1000,12 +1326,15 @@ fn read_directory_children(root: &Path) -> Vec<PathBuf> {
     children
 }
 
-fn availability_message(device: &DeviceInfo) -> String {
+fn availability_message(device: &DeviceInfo) -> StatusMessage {
     match &device.availability {
-        DeviceAvailability::Available => format!("{} is ready to import.", device.display_name),
-        DeviceAvailability::Unavailable(reason) => {
-            format!("{} cannot be used: {}", device.display_name, reason)
+        DeviceAvailability::Available => {
+            StatusMessage::success(format!("{} is ready to import.", device.display_name))
         }
+        DeviceAvailability::Unavailable(reason) => StatusMessage::warning(format!(
+            "{} cannot be used: {}",
+            device.display_name, reason
+        )),
     }
 }
 
@@ -1013,4 +1342,295 @@ fn trim_last_char(input: String) -> String {
     let mut chars = input.chars().collect::<Vec<_>>();
     chars.pop();
     chars.into_iter().collect()
+}
+
+fn panel_block<'a>(title: &'a str, active: bool) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(if active {
+            focus_style()
+        } else {
+            Style::default()
+        })
+}
+
+fn focus_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn title_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn label_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn section_style() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn helper_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn semantic_style(kind: StatusKind) -> Style {
+    match kind {
+        StatusKind::Info => Style::default().fg(Color::Blue),
+        StatusKind::Success => Style::default().fg(Color::Green),
+        StatusKind::Warning => Style::default().fg(Color::Yellow),
+        StatusKind::Error => Style::default().fg(Color::Red),
+    }
+}
+
+fn capacity_ok_style() -> Style {
+    Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn capacity_warn_style() -> Style {
+    Style::default()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
+    match screen {
+        Screen::Main => match focus {
+            FocusField::SourceTree => {
+                "Arrows move | Left/Right collapse or expand folders | Tab switches to theme | Enter reviews the import"
+            }
+            FocusField::Theme => {
+                "Type to edit the theme | Tab switches back to source browsing | Enter reviews the import"
+            }
+            _ => "Tab cycles focus between source browsing and theme entry.",
+        },
+        Screen::Settings => match focus {
+            FocusField::DestinationRoot | FocusField::DateFormat => {
+                "Type to edit the active field | Tab switches fields | Enter saves | Esc returns"
+            }
+            _ => "Edit archive preferences in-place, then press Enter to save.",
+        },
+        Screen::Confirmation => {
+            "Enter starts the copy | Esc cancels and returns to the archive screen"
+        }
+        Screen::Copying => {
+            "Wait for the copy to finish. Navigation away from this screen is disabled."
+        }
+        Screen::CopyResults => "Enter or Esc returns to the archive screen",
+    }
+}
+
+fn source_summary_text(app: &App) -> String {
+    match &app.source_summary {
+        AsyncValue::Idle => "Pick a source folder".to_string(),
+        AsyncValue::Loading => format!("{} ", app.loading_glyph()),
+        AsyncValue::Ready(summary) => format!(
+            "{} in {}",
+            format_bytes(summary.total_bytes),
+            pluralize(summary.file_count, "item", "items")
+        ),
+        AsyncValue::Error(_) => "N/A".to_string(),
+    }
+}
+
+fn source_summary_span(app: &App) -> Span<'static> {
+    let text = source_summary_text(app);
+    match capacity_state(app) {
+        Some(true) => Span::styled(text, capacity_ok_style()),
+        Some(false) => Span::styled(text, capacity_warn_style()),
+        None => Span::raw(text),
+    }
+}
+
+fn destination_space_text(app: &App) -> String {
+    match &app.destination_free_space {
+        AsyncValue::Idle => "Waiting for destination".to_string(),
+        AsyncValue::Loading => format!("{} ", app.loading_glyph()),
+        AsyncValue::Ready(bytes) => format_bytes(*bytes),
+        AsyncValue::Error(_) => "N/A".to_string(),
+    }
+}
+
+fn destination_space_span(app: &App) -> Span<'static> {
+    let text = destination_space_text(app);
+    match capacity_state(app) {
+        Some(true) => Span::styled(text, capacity_ok_style()),
+        Some(false) => Span::styled(text, capacity_warn_style()),
+        None => Span::raw(text),
+    }
+}
+
+fn capacity_state(app: &App) -> Option<bool> {
+    match (&app.source_summary, &app.destination_free_space) {
+        (AsyncValue::Ready(source), AsyncValue::Ready(free)) => Some(*free >= source.total_bytes),
+        _ => None,
+    }
+}
+
+fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn summarize_source_root(root: &Path) -> Result<SourceSummary> {
+    let files = discover_media_files(root)?;
+    let total_bytes = files.iter().map(|file| file.size_bytes).sum();
+    Ok(SourceSummary {
+        file_count: files.len(),
+        total_bytes,
+    })
+}
+
+fn available_space_for_destination(path: &Path) -> Result<u64> {
+    let probe = nearest_existing_ancestor(path)
+        .ok_or_else(|| anyhow!("no existing parent directory could be resolved"))?;
+    let disks = Disks::new_with_refreshed_list();
+    let disk = disks
+        .iter()
+        .filter(|disk| probe.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .ok_or_else(|| anyhow!("no mounted filesystem could be resolved"))?;
+    Ok(disk.available_space())
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        if !current.pop() {
+            return None;
+        }
+    }
+    Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_app() -> App {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let (background_sender, background_updates) = mpsc::channel();
+        App {
+            config_store: ConfigStore::from_path(config_path),
+            settings: ArchiveSettings {
+                destination_root: dir.path().to_path_buf(),
+                date_format: "%Y-%m-%d".to_string(),
+            },
+            devices: Vec::new(),
+            devices_loading: false,
+            directory_state: HashMap::new(),
+            expanded_sources: BTreeSet::new(),
+            pending_directory_loads: HashSet::new(),
+            source_entries: Vec::new(),
+            source_index: 0,
+            import_session: ImportSession::default(),
+            status_message: StatusMessage::info("Ready"),
+            screen: Screen::Main,
+            focus: FocusField::SourceTree,
+            copy_progress: None,
+            copy_result: None,
+            copy_updates: None,
+            background_updates,
+            background_sender,
+            animation_started_at: Instant::now(),
+            source_summary: AsyncValue::Idle,
+            source_summary_path: None,
+            destination_free_space: AsyncValue::Idle,
+            destination_free_path: None,
+        }
+    }
+
+    #[test]
+    fn contextual_help_is_screen_aware() {
+        assert!(contextual_help(Screen::Settings, FocusField::DateFormat).contains("Enter saves"));
+        assert!(
+            contextual_help(Screen::CopyResults, FocusField::SourceTree).contains("Enter or Esc")
+        );
+    }
+
+    #[test]
+    fn settings_feedback_reports_invalid_date_format() {
+        let mut app = test_app();
+        app.settings.date_format = "%Q".to_string();
+
+        let feedback = app.settings_feedback();
+
+        assert_eq!(feedback.kind, StatusKind::Error);
+        assert!(feedback.text.contains("unsupported date format specifier"));
+    }
+
+    #[test]
+    fn invalid_settings_save_stays_in_settings_screen() {
+        let mut app = test_app();
+        app.screen = Screen::Settings;
+        app.focus = FocusField::DateFormat;
+        app.settings.date_format = "%Q".to_string();
+
+        app.confirm_or_advance().unwrap();
+
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.status_message.kind, StatusKind::Error);
+        assert!(
+            app.status_message
+                .text
+                .contains("Settings could not be saved")
+        );
+    }
+
+    #[test]
+    fn formats_source_summary_sizes() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("frame.jpg"), vec![0u8; 2048]).unwrap();
+
+        let summary = summarize_source_root(root.path()).unwrap();
+
+        assert_eq!(summary.file_count, 1);
+        assert_eq!(summary.total_bytes, 2048);
+        assert_eq!(format_bytes(summary.total_bytes), "2.0 KB");
+    }
+
+    #[test]
+    fn reports_available_space_for_existing_destination() {
+        let root = tempdir().unwrap();
+
+        let free_space = available_space_for_destination(root.path()).unwrap();
+
+        assert!(free_space > 0);
+    }
 }

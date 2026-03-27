@@ -1,8 +1,5 @@
-# archive-settings-ui Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change add-cross-platform-media-archive-tui. Update Purpose after archive.
-## Requirements
 ### Requirement: Provide a settings workflow for archive preferences
 The system SHALL provide a dedicated settings workflow in the TUI where users can view and update persisted archive preferences, SHALL make the currently editable field obvious, and SHALL present preview and save guidance with clear visual separation from the editable values.
 
@@ -18,17 +15,6 @@ The system SHALL provide a dedicated settings workflow in the TUI where users ca
 - **WHEN** the user updates archive preferences in the settings workflow and saves them
 - **THEN** the system persists the new values and reloads them in future sessions
 
-### Requirement: Validate destination root preferences before saving
-The system SHALL validate destination root preferences before saving them and SHALL accept destination roots that do not yet exist when the path can be created successfully.
-
-#### Scenario: Missing destination root is accepted when creatable
-- **WHEN** the user enters a destination root that does not exist yet and its nearest existing parent directory can host a new folder
-- **THEN** the system saves the setting instead of rejecting it for not already existing
-
-#### Scenario: Invalid destination root is rejected on save
-- **WHEN** the user enters a destination root that resolves to a file path or a location that cannot be created
-- **THEN** the system blocks saving and shows a validation error that explains the problem
-
 ### Requirement: Validate date format preferences before saving
 The system SHALL let the user configure the date format used in archive folder names, SHALL validate that format before saving it, and SHALL present preview or validation feedback near the settings workflow so the user can understand the result before leaving the screen.
 
@@ -39,4 +25,3 @@ The system SHALL let the user configure the date format used in archive folder n
 #### Scenario: Invalid date format is rejected
 - **WHEN** the user enters an unsupported or invalid date format pattern
 - **THEN** the system blocks saving and shows a validation error that explains the problem without requiring the user to infer it from unrelated status text
-

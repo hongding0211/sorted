@@ -105,6 +105,7 @@ pub fn execute_copy<F>(plan: &CopyPlan, mut on_progress: F) -> Result<CopySummar
 where
     F: FnMut(CopyProgress),
 {
+    fs::create_dir_all(&plan.archive_plan.destination_root)?;
     ensure_archive_root(&plan.archive_plan.archive_root)?;
 
     let total_files = plan.files.len();
@@ -228,5 +229,41 @@ mod tests {
         assert_eq!(plan.files.len(), 1);
         assert_eq!(plan.source_root, dcim);
         assert_eq!(plan.files[0].relative_path, PathBuf::from("frame.jpg"));
+    }
+
+    #[test]
+    fn creates_missing_destination_root_before_copying() {
+        let device_root = tempdir().unwrap();
+        let base_root = tempdir().unwrap();
+        let destination_root = base_root.path().join("missing-root");
+        let nested = device_root.path().join("DCIM");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("frame.jpg"), "image").unwrap();
+
+        let settings = ArchiveSettings {
+            destination_root: destination_root.clone(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: device_root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = plan_copy(
+            &settings,
+            "shoot",
+            &device,
+            device_root.path(),
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert!(!destination_root.exists());
+
+        let summary = execute_copy(&plan, |_| {}).unwrap();
+
+        assert!(destination_root.exists());
+        assert!(summary.destination.join("DCIM/frame.jpg").exists());
     }
 }

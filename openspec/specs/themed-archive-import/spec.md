@@ -4,15 +4,23 @@
 TBD - created by archiving change add-cross-platform-media-archive-tui. Update Purpose after archive.
 ## Requirements
 ### Requirement: Remember archive destination settings
-The system SHALL let the user set a destination root directory for archived media and SHALL persist that directory for reuse in future sessions.
+The system SHALL let the user set a destination root directory for archived media, SHALL resolve supported home-directory shorthand in that destination before validation or use, and SHALL persist the resolved directory for reuse in future sessions.
 
 #### Scenario: Saved destination reused on next launch
-- **WHEN** the user previously saved a destination root directory
-- **THEN** the system preloads that directory as the default archive destination in the next session
+- **WHEN** the user previously saved a valid destination root directory
+- **THEN** the system preloads that resolved directory as the default archive destination in the next session
+
+#### Scenario: Home-directory shorthand is resolved before import
+- **WHEN** the configured destination root starts with `~/`
+- **THEN** the system resolves it against the current user's home directory before building the archive destination or starting the import
+
+#### Scenario: Missing destination root can be created
+- **WHEN** the configured destination root does not yet exist but its nearest existing parent directory is valid for directory creation
+- **THEN** the system allows the import to proceed and creates the destination root before copying media
 
 #### Scenario: Destination must be valid before import
-- **WHEN** the configured destination root is missing or cannot be written
-- **THEN** the system blocks the import and prompts the user to choose a writable destination
+- **WHEN** the configured destination root resolves to a non-directory path, cannot be created, or cannot be written
+- **THEN** the system blocks the import and prompts the user to choose a valid writable destination
 
 ### Requirement: Build themed archive paths from session metadata
 The system SHALL create destination paths using the pattern `dist/<theme><formatted-date>/<device-name>/`, where `theme` comes from the user input, `formatted-date` comes from the archive session date rendered with the saved date format preference, and `device-name` comes from the detected source device after filesystem-safe normalization.
@@ -30,13 +38,27 @@ The system SHALL create destination paths using the pattern `dist/<theme><format
 - **THEN** the system renders the archive date segment using that format when building the destination folder
 
 ### Requirement: Copy supported media into the resolved archive path
-The system SHALL copy supported photo and video files from the selected source device into the resolved archive folder and SHALL report progress and completion status to the user.
+The system SHALL copy supported photo and video files from the selected source device into the resolved archive folder, SHALL report progress and completion status to the user, and SHALL present copy-state information with clear hierarchy so users can distinguish active progress, successful completion, and partial failure outcomes.
 
 #### Scenario: Successful archive copy
 - **WHEN** the user confirms an import from a readable device to a writable destination
-- **THEN** the system creates the destination folders if needed and copies the selected media files into the device-specific archive folder
+- **THEN** the system creates the destination folders if needed, copies the selected media files into the device-specific archive folder, and shows a success-oriented completion summary when finished
 
 #### Scenario: Copy failure is surfaced to the user
 - **WHEN** a file copy fails during the archive process
-- **THEN** the system reports the failure and indicates that the archive session did not complete successfully
+- **THEN** the system reports the failure, indicates that the archive session did not complete successfully, and keeps failure details readable from the results view
+
+### Requirement: Present a confirmation summary before import starts
+The system SHALL show a confirmation view before the copy begins that summarizes the selected source, resolved destination, and next action so users can review the import before committing.
+
+#### Scenario: Confirmation view summarizes import inputs
+- **WHEN** the user advances from the main archive screen with a valid source and destination
+- **THEN** the system opens a confirmation view that clearly presents the source folder, destination preview, and the action required to start or cancel the copy
+
+### Requirement: Present copy progress with next-step clarity
+The system SHALL display copy progress in a way that makes current activity, completion counts, and what the user can do next easy to understand.
+
+#### Scenario: Copy progress emphasizes current state
+- **WHEN** an archive copy is running
+- **THEN** the system shows that the copy is in progress, includes a progress summary with completed versus total files, and indicates that the user must wait for the operation to finish before leaving the flow
 

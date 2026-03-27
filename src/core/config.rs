@@ -1,10 +1,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
 use crate::core::types::{ArchiveSettings, DatePreview};
@@ -43,11 +44,14 @@ impl ConfigStore {
             .with_context(|| format!("failed to read config at {}", self.config_path.display()))?;
         let parsed: PersistedConfig = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config at {}", self.config_path.display()))?;
-        Ok(parsed.settings)
+        Ok(ArchiveSettings {
+            destination_root: resolve_destination_root(&parsed.settings.destination_root)?,
+            date_format: parsed.settings.date_format,
+        })
     }
 
     pub fn save(&self, settings: &ArchiveSettings) -> Result<()> {
-        validate_settings(settings)?;
+        let (settings, _) = validate_settings(settings)?;
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create config directory {}", parent.display())
@@ -56,7 +60,7 @@ impl ConfigStore {
 
         let document = PersistedConfig {
             version: CONFIG_VERSION,
-            settings: settings.clone(),
+            settings,
         };
         let serialized = toml::to_string_pretty(&document).context("failed to serialize config")?;
         fs::write(&self.config_path, serialized)
@@ -77,39 +81,77 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(project_dirs.config_dir().join(CONFIG_FILE))
 }
 
-pub fn validate_settings(settings: &ArchiveSettings) -> Result<DatePreview> {
-    if settings.destination_root.as_os_str().is_empty() {
-        bail!("destination root cannot be empty");
-    }
-
-    if !settings.destination_root.exists() {
-        bail!(
-            "destination root {} does not exist",
-            settings.destination_root.display()
-        );
-    }
-
-    if !settings.destination_root.is_dir() {
-        bail!(
-            "destination root {} is not a directory",
-            settings.destination_root.display()
-        );
-    }
-
-    validate_date_format(&settings.date_format)
+pub fn validate_settings(settings: &ArchiveSettings) -> Result<(ArchiveSettings, DatePreview)> {
+    let destination_root = validate_destination_root(&settings.destination_root)?;
+    let date_preview = validate_date_format(&settings.date_format)?;
+    Ok((
+        ArchiveSettings {
+            destination_root,
+            date_format: settings.date_format.clone(),
+        },
+        date_preview,
+    ))
 }
 
-pub fn validate_destination_root(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
+pub fn resolve_destination_root(path: &Path) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         bail!("destination root cannot be empty");
     }
-    if !path.exists() {
-        bail!("destination root {} does not exist", path.display());
+
+    if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        let user_dirs =
+            UserDirs::new().ok_or_else(|| anyhow!("unable to resolve home directory"))?;
+        let relative = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+            .unwrap_or("");
+        let mut resolved = user_dirs.home_dir().to_path_buf();
+        if !relative.is_empty() {
+            resolved.push(relative);
+        }
+        return Ok(resolved);
     }
-    if !path.is_dir() {
-        bail!("destination root {} is not a directory", path.display());
+
+    Ok(PathBuf::from(trimmed))
+}
+
+pub fn validate_destination_root(path: &Path) -> Result<PathBuf> {
+    let resolved = resolve_destination_root(path)?;
+
+    if resolved.exists() {
+        if !resolved.is_dir() {
+            bail!("destination root {} is not a directory", resolved.display());
+        }
+        validate_directory_writable(&resolved)?;
+        return Ok(resolved);
     }
-    Ok(())
+
+    let ancestor = nearest_existing_ancestor(&resolved).ok_or_else(|| {
+        anyhow!(
+            "destination root {} cannot be created because no parent directory exists",
+            resolved.display()
+        )
+    })?;
+
+    if !ancestor.is_dir() {
+        bail!(
+            "destination root {} cannot be created because parent {} is not a directory",
+            resolved.display(),
+            ancestor.display()
+        );
+    }
+
+    validate_directory_writable(&ancestor).with_context(|| {
+        format!(
+            "destination root {} cannot be created from parent {}",
+            resolved.display(),
+            ancestor.display()
+        )
+    })?;
+
+    Ok(resolved)
 }
 
 pub fn validate_date_format(pattern: &str) -> Result<DatePreview> {
@@ -146,6 +188,29 @@ fn is_supported_specifier(ch: char) -> bool {
     )
 }
 
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        if !current.pop() {
+            return None;
+        }
+    }
+    Some(current)
+}
+
+fn validate_directory_writable(path: &Path) -> Result<()> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe = path.join(format!(".sorted-write-test-{}-{nanos}", std::process::id()));
+    fs::create_dir(&probe)
+        .with_context(|| format!("destination root {} is not writable", path.display()))?;
+    fs::remove_dir(&probe)
+        .with_context(|| format!("failed to clean up temporary probe in {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +243,59 @@ mod tests {
         let loaded = store.load().unwrap();
 
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn resolves_tilde_destination_root() {
+        let resolved = resolve_destination_root(Path::new("~/Desktop/temp")).unwrap();
+        let expected = UserDirs::new().unwrap().home_dir().join("Desktop/temp");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn accepts_missing_destination_root_when_parent_is_creatable() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("new-root");
+
+        let resolved = validate_destination_root(&target).unwrap();
+
+        assert_eq!(resolved, target);
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn rejects_destination_root_that_is_a_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("target-file");
+        fs::write(&file_path, "not a directory").unwrap();
+
+        let error = validate_destination_root(&file_path).unwrap_err();
+
+        assert!(error.to_string().contains("is not a directory"));
+    }
+
+    #[test]
+    fn saves_resolved_destination_root_in_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::from_path(config_path.clone());
+        let home = UserDirs::new().unwrap().home_dir().to_path_buf();
+        let suffix = format!(
+            "sorted-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let settings = ArchiveSettings {
+            destination_root: PathBuf::from(format!("~/{suffix}")),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+
+        store.save(&settings).unwrap();
+        let raw = fs::read_to_string(config_path).unwrap();
+
+        assert!(raw.contains(&home.join(&suffix).display().to_string()));
     }
 }
