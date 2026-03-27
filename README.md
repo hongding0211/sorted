@@ -76,14 +76,14 @@ Each release uploads platform-specific archives plus `sorted-checksums.txt`. See
 Use `cargo-release` to bump the crate version and create the matching `v*` git tag that triggers the GitHub release workflow:
 
 ```bash
-cargo release patch --no-publish
+cargo release patch --no-publish --execute
 ```
 
 Other common variants:
 
 ```bash
-cargo release minor --no-publish
-cargo release major --no-publish
+cargo release minor --no-publish --execute
+cargo release major --no-publish --execute
 ```
 
 Dry-run first to preview the next version and generated tag without changing git state:
