@@ -26,15 +26,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
-            binary_name: sorted
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive_ext: zip
-            binary_name: sorted.exe
-          - os: macos-14
-            target: x86_64-apple-darwin
+            target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
             binary_name: sorted
           - os: macos-14
@@ -50,6 +42,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install Linux musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build release binary
         run: cargo build --locked --release --target "${{ matrix.target }}"
@@ -112,12 +110,24 @@ jobs:
         shell: bash
         run: |
           cp scripts/install.sh dist/sorted-install.sh
-
           python3 - <<'PY'
           import hashlib
+          import shutil
           from pathlib import Path
 
           dist = Path("dist")
+          version = "${{ steps.version.outputs.version }}"
+
+          for path in sorted(dist.iterdir()):
+            if not path.is_file():
+              continue
+            name = path.name
+            if not name.startswith(f"sorted-{version}-"):
+              continue
+
+            latest_name = name.replace(f"sorted-{version}-", "sorted-latest-", 1)
+            shutil.copyfile(path, dist / latest_name)
+
           files = sorted(path for path in dist.iterdir() if path.is_file())
           lines = []
           for path in files:

@@ -8,7 +8,7 @@ DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
 REPO="${SORTED_REPO:-$DEFAULT_REPO}"
 INSTALL_DIR="${SORTED_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 REQUESTED_VERSION="${SORTED_VERSION:-}"
-API_BASE="${SORTED_API_BASE:-https://api.github.com}"
+DOWNLOAD_BASE="${SORTED_DOWNLOAD_BASE:-https://github.com}"
 
 usage() {
   cat <<'EOF'
@@ -21,7 +21,7 @@ Environment:
   SORTED_REPO         GitHub repository in owner/name form
   SORTED_INSTALL_DIR  Target directory for the executable
   SORTED_VERSION      Version override, for example v0.1.0
-  SORTED_API_BASE     Alternate GitHub API base URL
+  SORTED_DOWNLOAD_BASE Alternate GitHub download base URL
 EOF
 }
 
@@ -48,16 +48,8 @@ need_cmd rm
 need_cmd mkdir
 need_cmd cp
 need_cmd curl
-
-PYTHON_BIN=""
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON_BIN="python3"
-elif command -v python >/dev/null 2>&1; then
-  PYTHON_BIN="python"
-else
-  echo "missing required tool: python3 (or python)" >&2
-  exit 1
-fi
+need_cmd find
+need_cmd head
 
 OS_NAME="$(uname -s)"
 ARCH_NAME="$(uname -m)"
@@ -84,7 +76,7 @@ case "$OS_NAME" in
   Linux)
     case "$ARCH_NAME" in
       x86_64|amd64)
-        TARGET="x86_64-unknown-linux-gnu"
+        TARGET="x86_64-unknown-linux-musl"
         ARCHIVE_EXT="tar.gz"
         need_cmd tar
         ;;
@@ -113,9 +105,10 @@ normalize_version() {
 
 if [ -n "$REQUESTED_VERSION" ]; then
   VERSION="$(normalize_version "$REQUESTED_VERSION")"
-  RELEASE_ENDPOINT="${API_BASE}/repos/${REPO}/releases/tags/${VERSION}"
+  RELEASE_PATH="download/${VERSION}"
 else
-  RELEASE_ENDPOINT="${API_BASE}/repos/${REPO}/releases/latest"
+  VERSION="latest"
+  RELEASE_PATH="latest/download"
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -124,45 +117,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-METADATA_PATH="${TMP_DIR}/release.json"
-curl --fail --silent --show-error --location "$RELEASE_ENDPOINT" -o "$METADATA_PATH"
-
-RELEASE_INFO="$("$PYTHON_BIN" - "$METADATA_PATH" "$TARGET" "$ARCHIVE_EXT" <<'PY'
-import json
-import pathlib
-import sys
-
-metadata = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-target = sys.argv[2]
-archive_ext = sys.argv[3]
-tag_name = metadata.get("tag_name")
-assets = metadata.get("assets", [])
-expected = f"sorted-{tag_name}-{target}.{archive_ext}"
-
-for asset in assets:
-    if asset.get("name") == expected:
-        print(tag_name)
-        print(asset.get("browser_download_url", ""))
-        break
-else:
-    raise SystemExit(f"no release asset matches {expected}")
-PY
-)"
-
-VERSION="$(printf '%s\n' "$RELEASE_INFO" | sed -n '1p')"
-ASSET_URL="$(printf '%s\n' "$RELEASE_INFO" | sed -n '2p')"
-
-if [ -z "$ASSET_URL" ]; then
-  echo "failed to resolve a downloadable asset for ${TARGET}" >&2
-  exit 1
-fi
-
 ARCHIVE_PATH="${TMP_DIR}/${APP_NAME}.${ARCHIVE_EXT}"
 EXTRACT_DIR="${TMP_DIR}/extract"
 mkdir -p "$EXTRACT_DIR" "$INSTALL_DIR"
 
-echo "Downloading ${APP_NAME} ${VERSION} for ${TARGET}..."
-curl --fail --silent --show-error --location "$ASSET_URL" -o "$ARCHIVE_PATH"
+if [ "$VERSION" = "latest" ]; then
+  ARCHIVE_NAME="${APP_NAME}-latest-${TARGET}.${ARCHIVE_EXT}"
+  DOWNLOAD_LABEL="latest"
+else
+  ARCHIVE_NAME="${APP_NAME}-${VERSION}-${TARGET}.${ARCHIVE_EXT}"
+  DOWNLOAD_LABEL="${VERSION}"
+fi
+
+ASSET_URL="${DOWNLOAD_BASE}/${REPO}/releases/${RELEASE_PATH}/${ARCHIVE_NAME}"
+
+echo "Downloading ${APP_NAME} ${DOWNLOAD_LABEL} for ${TARGET}..."
+if ! curl --fail --silent --show-error --location --user-agent "${APP_NAME}-install-script" "$ASSET_URL" -o "$ARCHIVE_PATH"; then
+  echo "failed to download ${ARCHIVE_NAME} from GitHub Releases" >&2
+  echo "checked URL: ${ASSET_URL}" >&2
+  echo "make sure the requested release exists and includes that asset name" >&2
+  exit 1
+fi
 
 case "$ARCHIVE_EXT" in
   tar.gz)

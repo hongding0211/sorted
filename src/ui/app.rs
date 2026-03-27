@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -249,33 +249,12 @@ fn draw_source_tree(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ]
         }
     } else {
-        app.source_entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let prefix = if entry.has_children {
-                    if entry.is_expanded { "▾" } else { "▸" }
-                } else {
-                    "•"
-                };
-                let loading = if entry.is_loading {
-                    format!("  {}", app.loading_glyph())
-                } else {
-                    String::new()
-                };
-                let indent = "  ".repeat(entry.depth);
-                let style = if index == app.source_index && app.focus == FocusField::SourceTree {
-                    focus_style()
-                } else if entry.is_device_root && !entry.is_available {
-                    semantic_style(StatusKind::Warning).add_modifier(Modifier::BOLD)
-                } else if entry.is_device_root {
-                    label_style()
-                } else {
-                    Style::default()
-                };
-                ListItem::new(format!("{indent}{prefix} {}{loading}", entry.label)).style(style)
-            })
-            .collect()
+        browser_list_items(
+            &app.source_entries,
+            app.source_index,
+            app.focus == FocusField::SourceTree,
+            app.loading_glyph(),
+        )
     };
 
     let widget = List::new(items).block(panel_block(
@@ -335,29 +314,79 @@ fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let panels = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(area);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(panels[0]);
     let feedback = app.settings_feedback();
     let preview = validate_date_format(&app.settings.date_format)
         .map(|date| date.preview)
         .unwrap_or_else(|_| "Preview unavailable until the format is valid.".to_string());
+    let candidate = app
+        .selected_settings_candidate()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "No directory highlighted".to_string());
+    let settings_items = if app.settings_entries.is_empty() {
+        vec![
+            ListItem::new(Line::from(vec![Span::styled(
+                "No directories available to browse.",
+                semantic_style(StatusKind::Warning),
+            )])),
+            ListItem::new(Line::from(vec![Span::styled(
+                "Choose another saved path or create a writable parent first.",
+                helper_style(),
+            )])),
+        ]
+    } else {
+        browser_list_items(
+            &app.settings_entries,
+            app.settings_index,
+            app.focus == FocusField::DestinationRoot,
+            app.loading_glyph(),
+        )
+    };
+    let browser = List::new(settings_items).block(panel_block(
+        "Destination Browser",
+        app.focus == FocusField::DestinationRoot,
+    ));
+    frame.render_widget(browser, top[0]);
 
     let fields = Paragraph::new(vec![
         Line::from(vec![Span::styled("Settings", title_style())]),
         Line::from(Span::styled(
-            "Edit values in-place. The active field is highlighted so you always know where typing goes.",
+            "Browse a directory on the left, confirm it for Destination Root, then save from Date Format.",
+            helper_style(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Saved on Disk: ", label_style()),
+            Span::raw(app.persisted_settings.destination_root.display().to_string()),
+        ]),
+        Line::from(Span::styled(
+            "This is the currently persisted destination root.",
             helper_style(),
         )),
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "Destination Root: ",
+                "Pending Save: ",
                 field_style(app, FocusField::DestinationRoot),
             ),
             Span::raw(app.settings.destination_root.display().to_string()),
         ]),
         Line::from(Span::styled(
-            "Used as the writable base directory for each archive session.",
+            "Confirming a highlighted directory updates this value without writing to disk yet.",
+            helper_style(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Highlighted: ", label_style()),
+            Span::raw(candidate),
+        ]),
+        Line::from(Span::styled(
+            "Move with arrows and expand or collapse folders before confirming.",
             helper_style(),
         )),
         Line::from(""),
@@ -370,9 +399,12 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
             helper_style(),
         )),
     ])
-    .block(panel_block("Archive Preferences", true))
+    .block(panel_block(
+        "Archive Preferences",
+        app.focus == FocusField::DateFormat,
+    ))
     .wrap(Wrap { trim: true });
-    frame.render_widget(fields, panels[0]);
+    frame.render_widget(fields, top[1]);
 
     let feedback_panel = Paragraph::new(vec![
         Line::from(vec![
@@ -389,7 +421,7 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter saves these values. Esc returns without saving the current edits.",
+            "Destination Root focus: Enter confirms the highlighted directory. Date Format focus: Enter saves all pending settings. Esc discards this settings session.",
             helper_style(),
         )),
     ])
@@ -587,6 +619,7 @@ fn restore_terminal(terminal: &mut DefaultTerminal) -> Result<()> {
 struct App {
     config_store: ConfigStore,
     settings: ArchiveSettings,
+    persisted_settings: ArchiveSettings,
     devices: Vec<DeviceInfo>,
     devices_loading: bool,
     directory_state: HashMap<PathBuf, DirectoryLoadState>,
@@ -609,6 +642,10 @@ struct App {
     source_summary_path: Option<PathBuf>,
     destination_free_space: AsyncValue<u64>,
     destination_free_path: Option<PathBuf>,
+    settings_directory_state: HashMap<PathBuf, DirectoryLoadState>,
+    expanded_settings_directories: BTreeSet<PathBuf>,
+    settings_entries: Vec<SourceEntry>,
+    settings_index: usize,
 }
 
 impl App {
@@ -617,7 +654,8 @@ impl App {
         let (background_sender, background_updates) = mpsc::channel();
         let mut app = Self {
             config_store,
-            settings,
+            settings: settings.clone(),
+            persisted_settings: settings,
             devices: Vec::new(),
             devices_loading: true,
             directory_state: HashMap::new(),
@@ -642,6 +680,10 @@ impl App {
             source_summary_path: None,
             destination_free_space: AsyncValue::Idle,
             destination_free_path: None,
+            settings_directory_state: HashMap::new(),
+            expanded_settings_directories: BTreeSet::new(),
+            settings_entries: Vec::new(),
+            settings_index: 0,
         };
         app.request_device_refresh();
         app.request_destination_free_space();
@@ -693,9 +735,14 @@ impl App {
                 "Copy is running. Wait for it to finish before opening settings.",
             );
         } else {
+            self.settings = self.persisted_settings.clone();
+            self.initialize_settings_browser();
+            self.request_destination_free_space();
             self.screen = Screen::Settings;
             self.focus = FocusField::DestinationRoot;
-            self.status_message = StatusMessage::info("Editing persisted settings.");
+            self.status_message = StatusMessage::info(
+                "Browsing persisted settings. Confirm a directory, then save when ready.",
+            );
         }
     }
 
@@ -730,47 +777,90 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.screen != Screen::Main || self.focus != FocusField::SourceTree {
-            return;
+        match (self.screen, self.focus) {
+            (Screen::Main, FocusField::SourceTree) => {
+                if self.source_entries.is_empty() {
+                    return;
+                }
+                let max = self.source_entries.len() as isize - 1;
+                let next = (self.source_index as isize + delta).clamp(0, max) as usize;
+                self.source_index = next;
+                self.sync_selection_from_index();
+            }
+            (Screen::Settings, FocusField::DestinationRoot) => {
+                if self.settings_entries.is_empty() {
+                    return;
+                }
+                let max = self.settings_entries.len() as isize - 1;
+                let next = (self.settings_index as isize + delta).clamp(0, max) as usize;
+                self.settings_index = next;
+            }
+            _ => {}
         }
-        if self.source_entries.is_empty() {
-            return;
-        }
-        let max = self.source_entries.len() as isize - 1;
-        let next = (self.source_index as isize + delta).clamp(0, max) as usize;
-        self.source_index = next;
-        self.sync_selection_from_index();
     }
 
     fn handle_left(&mut self) {
-        if self.screen != Screen::Main || self.focus != FocusField::SourceTree {
-            return;
-        }
-        let Some(entry) = self.source_entries.get(self.source_index) else {
-            return;
-        };
-        if self.expanded_sources.remove(&entry.path) {
-            self.rebuild_source_entries();
-            self.source_index = self
-                .source_index
-                .min(self.source_entries.len().saturating_sub(1));
-            self.sync_selection_from_index();
+        match (self.screen, self.focus) {
+            (Screen::Main, FocusField::SourceTree) => {
+                let Some(entry) = self.source_entries.get(self.source_index) else {
+                    return;
+                };
+                if self.expanded_sources.remove(&entry.path) {
+                    self.rebuild_source_entries();
+                    self.source_index = self
+                        .source_index
+                        .min(self.source_entries.len().saturating_sub(1));
+                    self.sync_selection_from_index();
+                }
+            }
+            (Screen::Settings, FocusField::DestinationRoot) => {
+                let Some(entry) = self.settings_entries.get(self.settings_index) else {
+                    return;
+                };
+                if self.expanded_settings_directories.remove(&entry.path) {
+                    self.rebuild_settings_entries();
+                    self.settings_index = self
+                        .settings_index
+                        .min(self.settings_entries.len().saturating_sub(1));
+                }
+            }
+            _ => {}
         }
     }
 
     fn handle_right(&mut self) {
-        if self.screen != Screen::Main || self.focus != FocusField::SourceTree {
-            return;
-        }
-        let Some(entry) = self.source_entries.get(self.source_index).cloned() else {
-            return;
-        };
+        match (self.screen, self.focus) {
+            (Screen::Main, FocusField::SourceTree) => {
+                let Some(entry) = self.source_entries.get(self.source_index).cloned() else {
+                    return;
+                };
 
-        if entry.has_children {
-            self.expanded_sources.insert(entry.path.clone());
-            self.ensure_directory_loaded(&entry.path);
-            self.rebuild_source_entries();
-            self.sync_selection_from_index();
+                if entry.has_children {
+                    self.expanded_sources.insert(entry.path.clone());
+                    self.ensure_directory_loaded(&entry.path);
+                    self.rebuild_source_entries();
+                    self.sync_selection_from_index();
+                }
+            }
+            (Screen::Settings, FocusField::DestinationRoot) => {
+                let Some(entry) = self.settings_entries.get(self.settings_index).cloned() else {
+                    return;
+                };
+                if entry.has_children {
+                    self.expanded_settings_directories
+                        .insert(entry.path.clone());
+                    self.ensure_settings_directory_loaded(&entry.path);
+                    self.rebuild_settings_entries();
+                    if let Some(index) = self
+                        .settings_entries
+                        .iter()
+                        .position(|candidate| candidate.path == entry.path)
+                    {
+                        self.settings_index = index;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -832,22 +922,28 @@ impl App {
                 );
             }
             Screen::Settings => {
-                match validate_settings(&self.settings).and_then(|(settings, _)| {
-                    self.config_store.save(&settings)?;
-                    Ok(settings)
-                }) {
-                    Ok(settings) => {
-                        self.settings = settings;
-                        self.screen = Screen::Main;
-                        self.focus = FocusField::SourceTree;
-                        self.status_message = StatusMessage::success(format!(
-                            "Saved settings to {}",
-                            self.config_store.config_path().display()
-                        ));
-                    }
-                    Err(error) => {
-                        self.status_message =
-                            StatusMessage::error(format!("Settings could not be saved: {error}"));
+                if self.focus == FocusField::DestinationRoot {
+                    self.confirm_settings_destination();
+                } else {
+                    match validate_settings(&self.settings).and_then(|(settings, _)| {
+                        self.config_store.save(&settings)?;
+                        Ok(settings)
+                    }) {
+                        Ok(settings) => {
+                            self.persisted_settings = settings.clone();
+                            self.settings = settings;
+                            self.screen = Screen::Main;
+                            self.focus = FocusField::SourceTree;
+                            self.status_message = StatusMessage::success(format!(
+                                "Saved settings to {}",
+                                self.config_store.config_path().display()
+                            ));
+                        }
+                        Err(error) => {
+                            self.status_message = StatusMessage::error(format!(
+                                "Settings could not be saved: {error}"
+                            ));
+                        }
                     }
                 }
             }
@@ -864,6 +960,11 @@ impl App {
         match self.screen {
             Screen::Main => {}
             Screen::Settings | Screen::Confirmation | Screen::CopyResults => {
+                if self.screen == Screen::Settings {
+                    self.settings = self.persisted_settings.clone();
+                    self.initialize_settings_browser();
+                    self.request_destination_free_space();
+                }
                 self.screen = Screen::Main;
                 self.focus = FocusField::SourceTree;
                 self.status_message = StatusMessage::info("Returned to import screen.");
@@ -875,11 +976,6 @@ impl App {
         match self.focus {
             FocusField::Theme => {
                 self.import_session.theme.pop();
-            }
-            FocusField::DestinationRoot if self.screen == Screen::Settings => {
-                let updated = trim_last_char(self.settings.destination_root.display().to_string());
-                self.settings.destination_root = updated.into();
-                self.request_destination_free_space();
             }
             FocusField::DateFormat if self.screen == Screen::Settings => {
                 self.settings.date_format.pop();
@@ -895,12 +991,6 @@ impl App {
 
         match self.focus {
             FocusField::Theme if self.screen == Screen::Main => self.import_session.theme.push(ch),
-            FocusField::DestinationRoot if self.screen == Screen::Settings => {
-                let mut path = self.settings.destination_root.display().to_string();
-                path.push(ch);
-                self.settings.destination_root = path.into();
-                self.request_destination_free_space();
-            }
             FocusField::DateFormat if self.screen == Screen::Settings => {
                 self.settings.date_format.push(ch)
             }
@@ -1134,6 +1224,40 @@ impl App {
         };
     }
 
+    fn initialize_settings_browser(&mut self) {
+        self.settings_directory_state.clear();
+        self.expanded_settings_directories.clear();
+        self.settings_entries.clear();
+        self.settings_index = 0;
+
+        let root = settings_browser_root(&self.settings.destination_root);
+        let focus_path = nearest_existing_ancestor(&self.settings.destination_root)
+            .unwrap_or_else(|| root.clone());
+        let expansion_chain = path_chain(&root, &focus_path);
+
+        for path in &expansion_chain {
+            self.expanded_settings_directories.insert(path.clone());
+            self.settings_directory_state.insert(
+                path.clone(),
+                DirectoryLoadState::Loaded(read_directory_children(path)),
+            );
+        }
+
+        self.settings_directory_state
+            .entry(root.clone())
+            .or_insert_with(|| DirectoryLoadState::Loaded(read_directory_children(&root)));
+
+        self.rebuild_settings_entries();
+
+        if let Some(index) = self
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == focus_path)
+        {
+            self.settings_index = index;
+        }
+    }
+
     fn ensure_directory_loaded(&mut self, path: &Path) {
         if self.directory_state.contains_key(path) || self.pending_directory_loads.contains(path) {
             return;
@@ -1161,6 +1285,34 @@ impl App {
         }
     }
 
+    fn ensure_settings_directory_loaded(&mut self, path: &Path) {
+        self.settings_directory_state
+            .entry(path.to_path_buf())
+            .or_insert_with(|| DirectoryLoadState::Loaded(read_directory_children(path)));
+    }
+
+    fn rebuild_settings_entries(&mut self) {
+        let Some(root) = self.settings_browser_root() else {
+            self.settings_entries.clear();
+            self.settings_index = 0;
+            return;
+        };
+
+        self.ensure_settings_directory_loaded(&root);
+
+        let mut entries = Vec::new();
+        flatten_settings_tree(
+            &root,
+            &self.settings_directory_state,
+            &self.expanded_settings_directories,
+            &mut entries,
+        );
+        self.settings_entries = entries;
+        if self.settings_index >= self.settings_entries.len() {
+            self.settings_index = self.settings_entries.len().saturating_sub(1);
+        }
+    }
+
     fn sync_selection_from_index(&mut self) {
         if let Some(entry) = self.source_entries.get(self.source_index) {
             self.import_session.selected_source = Some(entry.path.clone());
@@ -1179,6 +1331,25 @@ impl App {
 
     fn selected_device(&self) -> Option<DeviceInfo> {
         self.import_session.selected_device.clone()
+    }
+
+    fn settings_browser_root(&self) -> Option<PathBuf> {
+        self.settings_entries
+            .first()
+            .map(|entry| entry.path.clone())
+            .or_else(|| {
+                if self.settings_directory_state.is_empty() {
+                    None
+                } else {
+                    Some(settings_browser_root(&self.settings.destination_root))
+                }
+            })
+    }
+
+    fn selected_settings_candidate(&self) -> Option<PathBuf> {
+        self.settings_entries
+            .get(self.settings_index)
+            .map(|entry| entry.path.clone())
     }
 
     fn is_copy_active(&self) -> bool {
@@ -1270,6 +1441,21 @@ impl App {
             let result = available_space_for_destination(&path).map_err(|error| error.to_string());
             let _ = sender.send(BackgroundUpdate::DestinationFreeSpaceLoaded(path, result));
         });
+    }
+
+    fn confirm_settings_destination(&mut self) {
+        let Some(path) = self.selected_settings_candidate() else {
+            self.status_message =
+                StatusMessage::warning("Highlight a directory before confirming Destination Root.");
+            return;
+        };
+
+        self.settings.destination_root = path.clone();
+        self.request_destination_free_space();
+        self.status_message = StatusMessage::info(format!(
+            "Destination Root set to {}. Press Tab to review Date Format, then Enter to save.",
+            path.display()
+        ));
     }
 }
 
@@ -1405,6 +1591,126 @@ fn read_directory_children(root: &Path) -> Vec<PathBuf> {
     children
 }
 
+fn browser_list_items(
+    entries: &[SourceEntry],
+    selected_index: usize,
+    is_focused: bool,
+    loading_glyph: &str,
+) -> Vec<ListItem<'static>> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let prefix = if entry.has_children {
+                if entry.is_expanded { "▾" } else { "▸" }
+            } else {
+                "•"
+            };
+            let loading = if entry.is_loading {
+                format!("  {loading_glyph}")
+            } else {
+                String::new()
+            };
+            let indent = "  ".repeat(entry.depth);
+            let style = if index == selected_index && is_focused {
+                focus_style()
+            } else if entry.is_device_root && !entry.is_available {
+                semantic_style(StatusKind::Warning).add_modifier(Modifier::BOLD)
+            } else if entry.is_device_root {
+                label_style()
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(format!("{indent}{prefix} {}{loading}", entry.label)).style(style)
+        })
+        .collect()
+}
+
+fn flatten_settings_tree(
+    root: &Path,
+    directory_state: &HashMap<PathBuf, DirectoryLoadState>,
+    expanded_paths: &BTreeSet<PathBuf>,
+    entries: &mut Vec<SourceEntry>,
+) {
+    let is_expanded = expanded_paths.contains(root);
+    let (has_children, is_loading) = match directory_state.get(root) {
+        Some(DirectoryLoadState::Loading) => (true, true),
+        Some(DirectoryLoadState::Loaded(children)) => (!children.is_empty(), false),
+        None => (true, false),
+    };
+
+    entries.push(SourceEntry {
+        device_id: String::new(),
+        path: root.to_path_buf(),
+        label: display_root_label(root),
+        depth: 0,
+        is_expanded,
+        has_children,
+        is_loading,
+        is_device_root: true,
+        is_available: true,
+    });
+
+    if !is_expanded {
+        return;
+    }
+
+    if let Some(DirectoryLoadState::Loaded(children)) = directory_state.get(root) {
+        for child in children {
+            flatten_directory_entry("", child, directory_state, expanded_paths, 1, entries);
+        }
+    }
+}
+
+fn settings_browser_root(path: &Path) -> PathBuf {
+    let resolved = nearest_existing_ancestor(path).unwrap_or_else(|| path.to_path_buf());
+    let mut root = PathBuf::new();
+
+    for component in resolved.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(std::path::MAIN_SEPARATOR.to_string()),
+            _ => break,
+        }
+    }
+
+    if root.as_os_str().is_empty() {
+        resolved
+    } else {
+        root
+    }
+}
+
+fn path_chain(root: &Path, target: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut current = root.to_path_buf();
+    chain.push(current.clone());
+
+    let relative = target.strip_prefix(root).unwrap_or(target);
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => {
+                current.push(segment);
+                chain.push(current.clone());
+            }
+            Component::CurDir => {}
+            _ => {}
+        }
+    }
+
+    chain
+}
+
+fn display_root_label(path: &Path) -> String {
+    let label = path.display().to_string();
+    if label.is_empty() {
+        std::path::MAIN_SEPARATOR.to_string()
+    } else {
+        label
+    }
+}
+
 fn availability_message(device: &DeviceInfo) -> StatusMessage {
     match &device.availability {
         DeviceAvailability::Available => {
@@ -1415,12 +1721,6 @@ fn availability_message(device: &DeviceInfo) -> StatusMessage {
             device.display_name, reason
         )),
     }
-}
-
-fn trim_last_char(input: String) -> String {
-    let mut chars = input.chars().collect::<Vec<_>>();
-    chars.pop();
-    chars.into_iter().collect()
 }
 
 fn panel_block<'a>(title: &'a str, active: bool) -> Block<'a> {
@@ -1499,8 +1799,11 @@ fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
             _ => "Tab cycles focus between source browsing and theme entry.",
         },
         Screen::Settings => match focus {
-            FocusField::DestinationRoot | FocusField::DateFormat => {
-                "Type to edit the active field | Tab switches fields | Enter saves | Esc returns"
+            FocusField::DestinationRoot => {
+                "Arrows move | Left/Right collapse or expand folders | Enter confirms Destination Root | Tab switches to Date Format"
+            }
+            FocusField::DateFormat => {
+                "Type to edit the format | Tab switches back to Destination Root | Enter saves all pending settings | Esc returns"
             }
             _ => "Edit archive preferences in-place, then press Enter to save.",
         },
@@ -1650,18 +1953,27 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{Builder, tempdir};
+
+    fn visible_tempdir() -> tempfile::TempDir {
+        Builder::new()
+            .prefix("settings-tree-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap()
+    }
 
     fn test_app() -> App {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let (background_sender, background_updates) = mpsc::channel();
+        let settings = ArchiveSettings {
+            destination_root: dir.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
         App {
             config_store: ConfigStore::from_path(config_path),
-            settings: ArchiveSettings {
-                destination_root: dir.path().to_path_buf(),
-                date_format: "%Y-%m-%d".to_string(),
-            },
+            settings: settings.clone(),
+            persisted_settings: settings,
             devices: Vec::new(),
             devices_loading: false,
             directory_state: HashMap::new(),
@@ -1684,12 +1996,19 @@ mod tests {
             source_summary_path: None,
             destination_free_space: AsyncValue::Idle,
             destination_free_path: None,
+            settings_directory_state: HashMap::new(),
+            expanded_settings_directories: BTreeSet::new(),
+            settings_entries: Vec::new(),
+            settings_index: 0,
         }
     }
 
     #[test]
     fn contextual_help_is_screen_aware() {
-        assert!(contextual_help(Screen::Settings, FocusField::DateFormat).contains("Enter saves"));
+        assert!(
+            contextual_help(Screen::Settings, FocusField::DestinationRoot).contains("confirms")
+        );
+        assert!(contextual_help(Screen::Settings, FocusField::DateFormat).contains("saves"));
         assert!(
             contextual_help(Screen::CopyResults, FocusField::SourceTree).contains("Enter or Esc")
         );
@@ -1760,7 +2079,7 @@ mod tests {
     #[test]
     fn invalid_settings_save_stays_in_settings_screen() {
         let mut app = test_app();
-        app.screen = Screen::Settings;
+        app.open_settings();
         app.focus = FocusField::DateFormat;
         app.settings.date_format = "%Q".to_string();
 
@@ -1804,7 +2123,10 @@ mod tests {
         let source_root = source_parent.path().join("DCIM");
         fs::create_dir_all(&source_root).unwrap();
         let destination_root = tempdir().unwrap();
-        let archive_root = destination_root.path().join("shoot_2026-03-27").join("EOS_R6");
+        let archive_root = destination_root
+            .path()
+            .join(format!("shoot_{}", Local::now().format("%Y-%m-%d")))
+            .join("EOS_R6");
         fs::create_dir_all(&archive_root).unwrap();
 
         let device = DeviceInfo {
@@ -1846,5 +2168,108 @@ mod tests {
         let free_space = available_space_for_destination(root.path()).unwrap();
 
         assert!(free_space > 0);
+    }
+
+    #[test]
+    fn browsing_settings_tree_does_not_change_destination_until_confirmed() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let current = root.path().join("current");
+        let sibling = root.path().join("sibling");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app.settings.destination_root = current.clone();
+        app.persisted_settings = app.settings.clone();
+
+        app.open_settings();
+
+        let sibling_index = app
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == sibling)
+            .unwrap();
+        app.settings_index = sibling_index;
+
+        assert_eq!(app.selected_settings_candidate(), Some(sibling));
+        assert_eq!(app.settings.destination_root, current);
+    }
+
+    #[test]
+    fn confirming_settings_destination_updates_pending_value_only() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let current = root.path().join("current");
+        let sibling = root.path().join("sibling");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app.settings.destination_root = current.clone();
+        app.persisted_settings = app.settings.clone();
+
+        app.open_settings();
+        app.settings_index = app
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == sibling)
+            .unwrap();
+
+        app.confirm_or_advance().unwrap();
+
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.settings.destination_root, sibling);
+        assert_eq!(app.persisted_settings.destination_root, current);
+    }
+
+    #[test]
+    fn escaping_settings_discards_unpersisted_destination_change() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let current = root.path().join("current");
+        let sibling = root.path().join("sibling");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app.settings.destination_root = current.clone();
+        app.persisted_settings = app.settings.clone();
+
+        app.open_settings();
+        app.settings_index = app
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == sibling)
+            .unwrap();
+        app.confirm_or_advance().unwrap();
+
+        app.go_back();
+
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.settings.destination_root, current);
+        assert_eq!(app.persisted_settings.destination_root, current);
+    }
+
+    #[test]
+    fn saving_settings_persists_confirmed_destination_selection() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let current = root.path().join("current");
+        let sibling = root.path().join("sibling");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app.settings.destination_root = current.clone();
+        app.persisted_settings = app.settings.clone();
+
+        app.open_settings();
+        app.settings_index = app
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == sibling)
+            .unwrap();
+        app.confirm_or_advance().unwrap();
+        app.focus = FocusField::DateFormat;
+
+        app.confirm_or_advance().unwrap();
+
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.settings.destination_root, sibling);
+        assert_eq!(app.persisted_settings.destination_root, sibling);
+        assert_eq!(app.config_store.load().unwrap().destination_root, sibling);
     }
 }

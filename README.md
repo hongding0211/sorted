@@ -49,15 +49,13 @@ Override the install directory:
 curl -fsSL https://github.com/hongding0211/sorted/releases/latest/download/sorted-install.sh | SORTED_INSTALL_DIR="$HOME/bin" sh
 ```
 
-Windows users should download the latest `.zip` package directly from [GitHub Releases](https://github.com/hongding0211/sorted/releases).
+Prebuilt GitHub Release assets are currently published for Linux and Apple Silicon macOS. On Windows or Intel macOS, build from source with Cargo instead.
 
 ## Release
 
 GitHub Actions publishes release artifacts for:
 
-- `x86_64-unknown-linux-gnu`
-- `x86_64-pc-windows-msvc`
-- `x86_64-apple-darwin`
+- `x86_64-unknown-linux-musl`
 - `aarch64-apple-darwin`
 
 To publish a release:

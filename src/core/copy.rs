@@ -406,7 +406,10 @@ mod tests {
             availability: DeviceAvailability::Available,
         };
 
-        let archive_root = destination_root.path().join("shoot_2026-03-27").join("EOS_R6");
+        let archive_root = destination_root
+            .path()
+            .join("shoot_2026-03-27")
+            .join("EOS_R6");
         fs::create_dir_all(&archive_root).unwrap();
 
         let plan = plan_copy(
