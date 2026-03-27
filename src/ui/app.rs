@@ -31,7 +31,10 @@ use crate::{
     core::{
         archive::{build_archive_plan, destination_preview},
         config::{ConfigStore, resolve_destination_root, validate_date_format, validate_settings},
-        copy::{CopyProgress, CopySummary, discover_media_files, execute_copy, plan_copy},
+        copy::{
+            CopyProgress, CopySummary, archive_destination_exists, discover_media_files,
+            execute_copy, plan_copy,
+        },
         types::{ArchiveSettings, DeviceAvailability, DeviceInfo, ImportSession},
     },
     platform::discovery::{DeviceDiscovery, SystemDeviceDiscovery, validate_selected_device},
@@ -802,6 +805,26 @@ impl App {
                     );
                     return Ok(());
                 }
+                if self.import_session.theme.trim().is_empty() {
+                    self.status_message =
+                        StatusMessage::warning("Enter a theme before starting the import.");
+                    self.focus = FocusField::Theme;
+                    return Ok(());
+                }
+                let archive_plan = build_archive_plan(
+                    &self.settings,
+                    &self.import_session.theme,
+                    &selected_device,
+                    Local::now(),
+                )?;
+                if archive_destination_exists(&archive_plan.archive_root) {
+                    self.status_message = StatusMessage::error(format!(
+                        "Archive destination {} already exists.",
+                        archive_plan.archive_root.display()
+                    ));
+                    self.focus = FocusField::SourceTree;
+                    return Ok(());
+                }
                 self.import_session.selected_device = Some(selected_device);
                 self.screen = Screen::Confirmation;
                 self.status_message = StatusMessage::info(
@@ -918,13 +941,22 @@ impl App {
             .selected_source()
             .ok_or_else(|| anyhow!("pick a source folder before importing"))?;
 
-        let plan = plan_copy(
+        let plan = match plan_copy(
             &self.settings,
             &self.import_session.theme,
             &selected,
             &source_root,
             Local::now(),
-        )?;
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.screen = Screen::Main;
+                self.focus = FocusField::SourceTree;
+                self.status_message =
+                    StatusMessage::error(format!("Import could not start: {error}"));
+                return Ok(());
+            }
+        };
         self.status_message = StatusMessage::info(format!(
             "Copying {} media file(s) from {}",
             plan.files.len(),
@@ -1741,6 +1773,58 @@ mod tests {
                 .text
                 .contains("Settings could not be saved")
         );
+    }
+
+    #[test]
+    fn missing_theme_blocks_confirmation_entry() {
+        let mut app = test_app();
+        let root = tempdir().unwrap();
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.devices = vec![device.clone()];
+        app.import_session.selected_device = Some(device);
+        app.import_session.selected_source = Some(root.path().to_path_buf());
+
+        app.confirm_or_advance().unwrap();
+
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.focus, FocusField::Theme);
+        assert_eq!(app.status_message.kind, StatusKind::Warning);
+        assert!(app.status_message.text.contains("Enter a theme"));
+    }
+
+    #[test]
+    fn existing_archive_destination_blocks_confirmation_entry() {
+        let mut app = test_app();
+        let source_parent = tempdir().unwrap();
+        let source_root = source_parent.path().join("DCIM");
+        fs::create_dir_all(&source_root).unwrap();
+        let destination_root = tempdir().unwrap();
+        let archive_root = destination_root.path().join("shoot_2026-03-27").join("EOS_R6");
+        fs::create_dir_all(&archive_root).unwrap();
+
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: source_parent.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.devices = vec![device.clone()];
+        app.settings.destination_root = destination_root.path().to_path_buf();
+        app.import_session.selected_device = Some(device);
+        app.import_session.selected_source = Some(source_root.clone());
+        app.import_session.theme = "shoot".to_string();
+
+        app.confirm_or_advance().unwrap();
+
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.focus, FocusField::SourceTree);
+        assert_eq!(app.status_message.kind, StatusKind::Error);
+        assert!(app.status_message.text.contains("already exists"));
     }
 
     #[test]

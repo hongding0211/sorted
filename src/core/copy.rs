@@ -93,6 +93,7 @@ pub fn plan_copy(
     now: chrono::DateTime<chrono::Local>,
 ) -> Result<CopyPlan> {
     let archive_plan = build_archive_plan(settings, theme, device, now)?;
+    validate_archive_destination_available(&archive_plan.archive_root)?;
     let files = discover_media_files(source_root)?;
     Ok(CopyPlan {
         source_device: device.clone(),
@@ -100,6 +101,21 @@ pub fn plan_copy(
         archive_plan,
         files,
     })
+}
+
+pub fn archive_destination_exists(archive_root: &Path) -> bool {
+    archive_root.exists()
+}
+
+fn validate_archive_destination_available(archive_root: &Path) -> Result<()> {
+    if archive_destination_exists(archive_root) {
+        bail!(
+            "archive destination {} already exists",
+            archive_root.display()
+        );
+    }
+
+    Ok(())
 }
 
 pub fn execute_copy<F, C>(
@@ -132,7 +148,6 @@ where
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-
         match fs::copy(&file.source_path, &destination) {
             Ok(_) => {
                 copied_files += 1;
@@ -326,5 +341,88 @@ mod tests {
 
         assert_eq!(summary.copied_files, 1);
         assert!(summary.was_cancelled);
+    }
+
+    #[test]
+    fn overwrites_existing_destination_file() {
+        let device_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let nested = device_root.path().join("DCIM");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("frame.jpg"), "new-image").unwrap();
+
+        let settings = ArchiveSettings {
+            destination_root: destination_root.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: device_root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = plan_copy(
+            &settings,
+            "shoot",
+            &device,
+            device_root.path(),
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(summary_destination_root(&plan).join("DCIM")).unwrap();
+        fs::write(
+            summary_destination_root(&plan).join("DCIM/frame.jpg"),
+            "old-image",
+        )
+        .unwrap();
+
+        let summary = execute_copy(&plan, |_| {}, || false).unwrap();
+
+        assert_eq!(summary.copied_files, 1);
+        assert!(summary.failures.is_empty());
+        assert_eq!(
+            fs::read_to_string(summary.destination.join("DCIM/frame.jpg")).unwrap(),
+            "new-image"
+        );
+    }
+
+    #[test]
+    fn rejects_existing_archive_destination() {
+        let device_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let source_root = device_root.path().join("DCIM");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("frame.jpg"), "image").unwrap();
+
+        let settings = ArchiveSettings {
+            destination_root: destination_root.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: device_root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let archive_root = destination_root.path().join("shoot_2026-03-27").join("EOS_R6");
+        fs::create_dir_all(&archive_root).unwrap();
+
+        let plan = plan_copy(
+            &settings,
+            "shoot",
+            &device,
+            &source_root,
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        );
+
+        let error = plan.unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+    }
+
+    fn summary_destination_root(plan: &CopyPlan) -> PathBuf {
+        plan.archive_plan.archive_root.clone()
     }
 }
