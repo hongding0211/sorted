@@ -114,6 +114,11 @@ This repository is configured so `cargo-release`:
 - `Enter`: confirm or save
 - `Esc`: go back
 
+## TODO
+
+- [ ] Make tree-view pagination auto-scroll so lower entries remain visible when changing pages
+- [ ] Add more convenient file navigation and file operation capabilities
+
 ## OpenSpec
 
 This repository also includes OpenSpec artifacts and archived changes under
