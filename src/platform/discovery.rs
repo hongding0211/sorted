@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use sysinfo::DiskKind;
 use sysinfo::Disks;
 
@@ -96,15 +96,44 @@ fn build_device_info(raw_name: &str, mount_path: PathBuf) -> DeviceInfo {
 fn should_include_disk(disk: &sysinfo::Disk) -> bool {
     #[cfg(target_os = "macos")]
     {
-        disk.mount_point().starts_with("/Volumes")
-            && disk.mount_point() != Path::new("/Volumes")
-            && disk.mount_point().is_dir()
+        return should_include_macos_disk(disk.mount_point());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        disk.kind() != DiskKind::Unknown(-1) && disk.is_removable()
+        return should_include_linux_disk(disk.is_removable(), disk.mount_point());
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        return should_include_windows_disk(disk.kind(), disk.is_removable(), disk.mount_point());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        false
+    }
+}
+
+fn has_browsable_mount_point(mount_point: &Path) -> bool {
+    mount_point.is_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn should_include_macos_disk(mount_point: &Path) -> bool {
+    mount_point.starts_with("/Volumes")
+        && mount_point != Path::new("/Volumes")
+        && has_browsable_mount_point(mount_point)
+}
+
+#[cfg(target_os = "linux")]
+fn should_include_linux_disk(is_removable: bool, mount_point: &Path) -> bool {
+    is_removable && has_browsable_mount_point(mount_point)
+}
+
+#[cfg(target_os = "windows")]
+fn should_include_windows_disk(kind: DiskKind, is_removable: bool, mount_point: &Path) -> bool {
+    kind != DiskKind::Unknown(-1) && is_removable && has_browsable_mount_point(mount_point)
 }
 
 #[cfg(target_os = "macos")]
@@ -176,6 +205,34 @@ mod tests {
     fn builds_device_info_from_mount_path() {
         let device = build_device_info("", PathBuf::from("/Volumes/NIKON Z 6_2"));
         assert_eq!(device.display_name, "NIKON Z 6_2");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn includes_linux_removable_mount_even_with_unknown_disk_kind() {
+        let mount = tempdir().unwrap();
+
+        assert!(should_include_linux_disk(true, mount.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn excludes_linux_mount_when_not_removable() {
+        let mount = tempdir().unwrap();
+
+        assert!(!should_include_linux_disk(false, mount.path()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn excludes_windows_unknown_disk_kind() {
+        let mount = tempdir().unwrap();
+
+        assert!(!should_include_windows_disk(
+            DiskKind::Unknown(-1),
+            true,
+            mount.path()
+        ));
     }
 
     #[cfg(target_os = "macos")]

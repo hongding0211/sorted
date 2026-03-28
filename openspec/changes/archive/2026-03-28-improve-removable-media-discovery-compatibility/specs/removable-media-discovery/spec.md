@@ -1,8 +1,5 @@
-# removable-media-discovery Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change add-cross-platform-media-archive-tui. Update Purpose after archive.
-## Requirements
 ### Requirement: Detect removable storage devices across supported desktop platforms
 The system SHALL discover removable storage devices on macOS, Windows, and Linux, SHALL expose each detected device to the TUI with a stable display name, mount path, and availability state, and SHALL communicate discovery loading and empty states clearly during browsing and refresh. On Linux, the system SHALL treat a mounted, readable removable filesystem as a detectable device even when the underlying platform reports incomplete or unknown disk-kind metadata.
 
@@ -21,14 +18,3 @@ The system SHALL discover removable storage devices on macOS, Windows, and Linux
 #### Scenario: Linux removable media uses unknown disk-kind metadata
 - **WHEN** a Linux environment reports a removable mounted filesystem with a valid mount path but an unknown disk kind
 - **THEN** the system still includes that filesystem in the removable device list
-
-### Requirement: Exclude unsupported or unavailable sources
-The system SHALL ignore sources that are not readable mounted filesystems, SHALL prevent users from starting an archive import from an unavailable device, and SHALL make unavailable state messaging clear during source browsing.
-
-#### Scenario: Non-readable source is filtered out
-- **WHEN** a device cannot be read or does not expose a mounted filesystem path
-- **THEN** the system does not offer that source as an import candidate
-
-#### Scenario: Device becomes unavailable before import
-- **WHEN** the user selects a device that is removed before copy starts
-- **THEN** the system blocks the import and reports that the selected device is no longer available in a way that is clearly distinguishable from normal informational feedback
