@@ -1,6 +1,8 @@
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +22,11 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 pub struct CopyProgress {
     pub copied_files: usize,
     pub total_files: usize,
+    pub copied_bytes: u64,
+    pub total_bytes: u64,
+    pub elapsed: Duration,
+    pub bytes_per_second: Option<u64>,
+    pub estimated_remaining: Option<Duration>,
     pub current_file: Option<PathBuf>,
 }
 
@@ -33,8 +40,78 @@ pub struct CopyFailure {
 pub struct CopySummary {
     pub destination: PathBuf,
     pub copied_files: usize,
+    pub copied_bytes: u64,
+    pub total_bytes: u64,
+    pub elapsed: Duration,
     pub failures: Vec<CopyFailure>,
     pub was_cancelled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressTracker {
+    started_at: Instant,
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl ProgressTracker {
+    fn new(started_at: Instant) -> Self {
+        let mut samples = VecDeque::new();
+        samples.push_back((started_at, 0));
+        Self {
+            started_at,
+            samples,
+        }
+    }
+
+    fn record(
+        &mut self,
+        copied_files: usize,
+        total_files: usize,
+        copied_bytes: u64,
+        total_bytes: u64,
+        current_file: Option<PathBuf>,
+        now: Instant,
+    ) -> CopyProgress {
+        self.samples.push_back((now, copied_bytes));
+        while self.samples.len() > 6 {
+            self.samples.pop_front();
+        }
+
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let bytes_per_second = self.smoothed_bytes_per_second();
+        let estimated_remaining = bytes_per_second.and_then(|rate| {
+            if rate == 0 || copied_bytes >= total_bytes {
+                None
+            } else {
+                Some(Duration::from_secs(
+                    (total_bytes - copied_bytes).div_ceil(rate),
+                ))
+            }
+        });
+
+        CopyProgress {
+            copied_files,
+            total_files,
+            copied_bytes,
+            total_bytes,
+            elapsed,
+            bytes_per_second,
+            estimated_remaining,
+            current_file,
+        }
+    }
+
+    fn smoothed_bytes_per_second(&self) -> Option<u64> {
+        let (start_time, start_bytes) = self.samples.front()?;
+        let (end_time, end_bytes) = self.samples.back()?;
+        let elapsed = end_time.saturating_duration_since(*start_time);
+        if elapsed < Duration::from_millis(500) || end_bytes <= start_bytes {
+            return None;
+        }
+
+        let rate = (*end_bytes - *start_bytes) as f64 / elapsed.as_secs_f64();
+        (rate.is_finite() && rate > 0.0).then_some(rate.round() as u64)
+    }
 }
 
 pub fn discover_media_files(root: &Path) -> Result<Vec<MediaFile>> {
@@ -131,14 +208,21 @@ where
     ensure_archive_root(&plan.archive_plan.archive_root)?;
 
     let total_files = plan.files.len();
+    let total_bytes = plan.files.iter().map(|file| file.size_bytes).sum();
     let mut copied_files = 0usize;
+    let mut copied_bytes = 0u64;
     let mut failures = Vec::new();
+    let started_at = Instant::now();
+    let mut tracker = ProgressTracker::new(started_at);
 
     for file in &plan.files {
         if should_cancel() {
             return Ok(CopySummary {
                 destination: plan.archive_plan.archive_root.clone(),
                 copied_files,
+                copied_bytes,
+                total_bytes,
+                elapsed: started_at.elapsed(),
                 failures,
                 was_cancelled: true,
             });
@@ -151,11 +235,15 @@ where
         match fs::copy(&file.source_path, &destination) {
             Ok(_) => {
                 copied_files += 1;
-                on_progress(CopyProgress {
+                copied_bytes += file.size_bytes;
+                on_progress(tracker.record(
                     copied_files,
                     total_files,
-                    current_file: Some(destination),
-                });
+                    copied_bytes,
+                    total_bytes,
+                    Some(destination),
+                    Instant::now(),
+                ));
             }
             Err(error) => failures.push(CopyFailure {
                 file: file.source_path.clone(),
@@ -167,6 +255,9 @@ where
     Ok(CopySummary {
         destination: plan.archive_plan.archive_root.clone(),
         copied_files,
+        copied_bytes,
+        total_bytes,
+        elapsed: started_at.elapsed(),
         failures,
         was_cancelled: false,
     })
@@ -222,6 +313,8 @@ mod tests {
         let summary = execute_copy(&plan, |_| {}, || false).unwrap();
 
         assert_eq!(summary.copied_files, 1);
+        assert_eq!(summary.copied_bytes, "image".len() as u64);
+        assert_eq!(summary.total_bytes, "image".len() as u64);
         assert!(summary.failures.is_empty());
         assert!(!summary.was_cancelled);
         assert!(summary.destination.join("DCIM/frame.jpg").exists());
@@ -340,6 +433,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.copied_files, 1);
+        assert_eq!(summary.copied_bytes, 1);
         assert!(summary.was_cancelled);
     }
 
@@ -380,6 +474,7 @@ mod tests {
         let summary = execute_copy(&plan, |_| {}, || false).unwrap();
 
         assert_eq!(summary.copied_files, 1);
+        assert_eq!(summary.copied_bytes, "new-image".len() as u64);
         assert!(summary.failures.is_empty());
         assert_eq!(
             fs::read_to_string(summary.destination.join("DCIM/frame.jpg")).unwrap(),
@@ -427,5 +522,25 @@ mod tests {
 
     fn summary_destination_root(plan: &CopyPlan) -> PathBuf {
         plan.archive_plan.archive_root.clone()
+    }
+
+    #[test]
+    fn progress_tracker_reports_rate_and_eta_after_multiple_samples() {
+        let started_at = Instant::now();
+        let mut tracker = ProgressTracker::new(started_at);
+        let progress = tracker.record(
+            2,
+            4,
+            600,
+            1200,
+            Some(PathBuf::from("/tmp/out/frame.cr3")),
+            started_at + Duration::from_secs(2),
+        );
+
+        assert_eq!(progress.copied_bytes, 600);
+        assert_eq!(progress.total_bytes, 1200);
+        assert_eq!(progress.elapsed, Duration::from_secs(2));
+        assert_eq!(progress.bytes_per_second, Some(300));
+        assert_eq!(progress.estimated_remaining, Some(Duration::from_secs(2)));
     }
 }

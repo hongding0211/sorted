@@ -37,7 +37,10 @@ use crate::{
         },
         types::{ArchiveSettings, DeviceAvailability, DeviceInfo, ImportSession},
     },
-    platform::discovery::{DeviceDiscovery, SystemDeviceDiscovery, validate_selected_device},
+    platform::discovery::{
+        DeviceDiscovery, DeviceEjectOutcome, SystemDeviceDiscovery, eject_device,
+        validate_selected_device,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +182,7 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let status_height = if app.is_copy_active() { 6 } else { 4 };
+    let status_height = if app.is_copy_active() { 7 } else { 4 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -503,6 +506,10 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled("Files copied: ", label_style()),
                     Span::raw(result.copied_files.to_string()),
                 ]),
+                Line::from(vec![
+                    Span::styled("Elapsed: ", label_style()),
+                    Span::raw(format_duration(result.elapsed)),
+                ]),
                 Line::from(""),
             ];
             if result.failures.is_empty() {
@@ -559,6 +566,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Min(1),
             ])
             .split(inner);
@@ -579,12 +587,19 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .label(copy_progress_summary(app.copy_progress.as_ref()));
         frame.render_widget(gauge, rows[1]);
 
+        let metrics = Paragraph::new(Line::from(vec![
+            Span::styled("Metrics: ", helper_style()),
+            Span::raw(copy_progress_metrics(app.copy_progress.as_ref())),
+        ]))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(metrics, rows[2]);
+
         let current = Paragraph::new(Line::from(vec![
             Span::styled("Current: ", helper_style()),
             Span::raw(copy_progress_current_file(app.copy_progress.as_ref())),
         ]))
         .wrap(Wrap { trim: true });
-        frame.render_widget(current, rows[2]);
+        frame.render_widget(current, rows[3]);
     } else {
         let status = Paragraph::new(vec![
             Line::from(vec![
@@ -647,6 +662,7 @@ struct App {
     copy_result: Option<CopySummary>,
     copy_updates: Option<Receiver<CopyUpdate>>,
     copy_cancel: Option<Arc<AtomicBool>>,
+    pending_device_refresh_status: Option<StatusMessage>,
     background_updates: Receiver<BackgroundUpdate>,
     background_sender: Sender<BackgroundUpdate>,
     animation_started_at: Instant,
@@ -689,6 +705,7 @@ impl App {
             copy_result: None,
             copy_updates: None,
             copy_cancel: None,
+            pending_device_refresh_status: None,
             background_updates,
             background_sender,
             animation_started_at: Instant::now(),
@@ -722,6 +739,7 @@ impl App {
                     }
                     return Ok(true);
                 }
+                KeyCode::Char('e') | KeyCode::Char('E') => self.request_safe_eject(),
                 KeyCode::Char('r') | KeyCode::Char('R') => self.request_device_refresh(),
                 KeyCode::Char('s') | KeyCode::Char('S') => self.open_settings(),
                 KeyCode::Char('d') | KeyCode::Char('D') if self.is_directory_focus() => {
@@ -789,13 +807,62 @@ impl App {
             );
             return;
         }
+        self.request_device_refresh_with(None, Some(StatusMessage::info("Refreshing devices in the background...")));
+    }
+
+    fn request_device_refresh_with(
+        &mut self,
+        completed_message: Option<StatusMessage>,
+        loading_message: Option<StatusMessage>,
+    ) {
         self.devices_loading = true;
-        self.status_message = StatusMessage::info("Refreshing devices in the background...");
+        self.pending_device_refresh_status = completed_message;
+        if let Some(message) = loading_message {
+            self.status_message = message;
+        }
         let sender = self.background_sender.clone();
         thread::spawn(move || {
             let discovery = SystemDeviceDiscovery;
             let result = discovery.discover();
             let _ = sender.send(BackgroundUpdate::DevicesLoaded(result));
+        });
+    }
+
+    fn request_safe_eject(&mut self) {
+        let Some(device) = self.selected_device() else {
+            self.status_message =
+                StatusMessage::warning("Select a removable device before requesting eject.");
+            return;
+        };
+
+        if self.is_copy_active() {
+            self.status_message = StatusMessage::warning(format!(
+                "{} cannot be ejected while copying is in progress.",
+                device.display_name
+            ));
+            return;
+        }
+
+        let device = match validate_selected_device(&device, &self.devices) {
+            Ok(device) => device,
+            Err(error) => {
+                self.status_message = StatusMessage::error(format!(
+                    "Could not validate the selected device: {error}"
+                ));
+                return;
+            }
+        };
+        if !device.is_available() {
+            self.status_message = availability_message(&device);
+            return;
+        }
+
+        self.status_message =
+            StatusMessage::info(format!("Requesting safe eject for {}...", device.display_name));
+        let sender = self.background_sender.clone();
+        thread::spawn(move || {
+            let outcome = eject_device(&device);
+            let _ = sender.send(BackgroundUpdate::DeviceEjected(device, outcome));
         });
     }
 
@@ -1154,6 +1221,11 @@ impl App {
         self.copy_progress = Some(CopyProgress {
             copied_files: 0,
             total_files: plan.files.len(),
+            copied_bytes: 0,
+            total_bytes: plan.files.iter().map(|file| file.size_bytes).sum(),
+            elapsed: Duration::ZERO,
+            bytes_per_second: None,
+            estimated_remaining: None,
             current_file: None,
         });
         self.copy_result = None;
@@ -1188,6 +1260,7 @@ impl App {
                             self.apply_devices(devices);
                         }
                         Err(error) => {
+                            self.pending_device_refresh_status = None;
                             self.devices.clear();
                             self.source_entries.clear();
                             self.import_session.selected_device = None;
@@ -1197,6 +1270,29 @@ impl App {
                         }
                     }
                 }
+                BackgroundUpdate::DeviceEjected(device, outcome) => match outcome {
+                    DeviceEjectOutcome::Ejected => {
+                        self.request_device_refresh_with(
+                            Some(StatusMessage::success(format!(
+                                "{} is ready to remove.",
+                                device.display_name
+                            ))),
+                            None,
+                        );
+                    }
+                    DeviceEjectOutcome::Unsupported(reason) => {
+                        self.status_message = StatusMessage::warning(format!(
+                            "{} could not be ejected safely: {}",
+                            device.display_name, reason
+                        ));
+                    }
+                    DeviceEjectOutcome::Failed(reason) => {
+                        self.status_message = StatusMessage::warning(format!(
+                            "{} is not safe to remove yet: {}",
+                            device.display_name, reason
+                        ));
+                    }
+                },
                 BackgroundUpdate::DirectoryLoaded(path, children) => {
                     self.pending_directory_loads.remove(&path);
                     self.directory_state
@@ -1232,10 +1328,7 @@ impl App {
                         self.status_message = if self.is_cancel_requested() {
                             StatusMessage::warning("Stopping copy after the current file...")
                         } else {
-                            StatusMessage::info(format!(
-                                "Copying media files: {}/{} complete",
-                                progress.copied_files, progress.total_files
-                            ))
+                            StatusMessage::info(copy_status_message(&progress))
                         };
                     }
                     CopyUpdate::Finished(result) => finished = Some(result),
@@ -1253,18 +1346,21 @@ impl App {
                     self.copy_progress = None;
                     self.status_message = if summary.was_cancelled {
                         StatusMessage::warning(format!(
-                            "Copy interrupted after {} file(s).",
-                            summary.copied_files
+                            "Copy interrupted after {} in {}.",
+                            pluralize(summary.copied_files, "file", "files"),
+                            format_duration(summary.elapsed)
                         ))
                     } else if summary.failures.is_empty() {
                         StatusMessage::success(format!(
-                            "Copy finished: {} file(s) archived.",
-                            summary.copied_files
+                            "Copy finished: {} archived in {}.",
+                            pluralize(summary.copied_files, "file", "files"),
+                            format_duration(summary.elapsed)
                         ))
                     } else {
                         StatusMessage::warning(format!(
-                            "Copy completed with {} failure(s).",
-                            summary.failures.len()
+                            "Copy completed in {} with {}.",
+                            format_duration(summary.elapsed),
+                            pluralize(summary.failures.len(), "failure", "failures")
                         ))
                     };
                 }
@@ -1316,7 +1412,9 @@ impl App {
             self.source_summary_path = None;
         }
 
-        self.status_message = if self.devices.is_empty() {
+        self.status_message = if let Some(message) = self.pending_device_refresh_status.take() {
+            message
+        } else if self.devices.is_empty() {
             StatusMessage::warning("No removable devices found.")
         } else {
             StatusMessage::success(format!("Found {} removable device(s).", self.devices.len()))
@@ -1560,6 +1658,7 @@ impl App {
 
 enum BackgroundUpdate {
     DevicesLoaded(Result<Vec<DeviceInfo>>),
+    DeviceEjected(DeviceInfo, DeviceEjectOutcome),
     DirectoryLoaded(PathBuf, Vec<PathBuf>),
     SourceSummaryLoaded(PathBuf, Result<SourceSummary, String>),
     DestinationFreeSpaceLoaded(PathBuf, Result<u64, String>),
@@ -1955,7 +2054,7 @@ fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
 }
 
 fn global_help_text(_screen: Screen) -> &'static str {
-    "Ctrl+Q quit | Ctrl+R refresh | Ctrl+S settings"
+    "Ctrl+Q quit | Ctrl+R refresh | Ctrl+S settings | Ctrl+E eject"
 }
 
 fn copy_progress_ratio(progress: Option<&CopyProgress>) -> f64 {
@@ -1981,10 +2080,63 @@ fn copy_progress_summary(progress: Option<&CopyProgress>) -> String {
     }
 }
 
+fn copy_progress_metrics(progress: Option<&CopyProgress>) -> String {
+    match progress {
+        Some(progress) => {
+            let rate = progress
+                .bytes_per_second
+                .map(|value| format!("{}/s", format_bytes(value)))
+                .unwrap_or_else(|| "calculating speed".to_string());
+            let eta = progress
+                .estimated_remaining
+                .map(format_duration)
+                .unwrap_or_else(|| "estimating ETA".to_string());
+            format!(
+                "{} of {} | {} | ETA {} | Elapsed {}",
+                format_bytes(progress.copied_bytes),
+                format_bytes(progress.total_bytes),
+                rate,
+                eta,
+                format_duration(progress.elapsed)
+            )
+        }
+        None => "Waiting for copy metrics...".to_string(),
+    }
+}
+
 fn copy_progress_current_file(progress: Option<&CopyProgress>) -> String {
     match progress.and_then(|progress| progress.current_file.as_ref()) {
         Some(path) => path.display().to_string(),
         None => "Preparing copy job...".to_string(),
+    }
+}
+
+fn copy_status_message(progress: &CopyProgress) -> String {
+    let mut message = format!(
+        "Copying media files: {}/{} complete",
+        progress.copied_files, progress.total_files
+    );
+    if let Some(rate) = progress.bytes_per_second {
+        message.push_str(&format!(" at {}/s", format_bytes(rate)));
+    }
+    if let Some(eta) = progress.estimated_remaining {
+        message.push_str(&format!(", ETA {}", format_duration(eta)));
+    }
+    message
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -2131,6 +2283,7 @@ mod tests {
             copy_result: None,
             copy_updates: None,
             copy_cancel: None,
+            pending_device_refresh_status: None,
             background_updates,
             background_sender,
             animation_started_at: Instant::now(),
@@ -2169,6 +2322,11 @@ mod tests {
         let progress = CopyProgress {
             copied_files: 3,
             total_files: 5,
+            copied_bytes: 3 * 1024 * 1024,
+            total_bytes: 5 * 1024 * 1024,
+            elapsed: Duration::from_secs(12),
+            bytes_per_second: Some(256 * 1024),
+            estimated_remaining: Some(Duration::from_secs(8)),
             current_file: Some(PathBuf::from("/tmp/media/frame.cr3")),
         };
 
@@ -2181,6 +2339,8 @@ mod tests {
             copy_progress_current_file(Some(&progress)),
             "/tmp/media/frame.cr3"
         );
+        assert!(copy_progress_metrics(Some(&progress)).contains("ETA 8s"));
+        assert!(copy_status_message(&progress).contains("ETA 8s"));
     }
 
     #[test]
@@ -2210,6 +2370,28 @@ mod tests {
         assert_eq!(app.status_message.kind, StatusKind::Warning);
         assert!(cancel.load(Ordering::SeqCst));
         assert!(app.status_message.text.contains("Stopping copy"));
+    }
+
+    #[test]
+    fn ctrl_e_blocks_safe_eject_while_copy_is_active() {
+        let mut app = test_app();
+        let root = tempdir().unwrap();
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        let (_sender, receiver) = mpsc::channel();
+        app.devices = vec![device.clone()];
+        app.import_session.selected_device = Some(device);
+        app.copy_updates = Some(receiver);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.status_message.kind, StatusKind::Warning);
+        assert!(app.status_message.text.contains("cannot be ejected while copying"));
     }
 
     #[test]

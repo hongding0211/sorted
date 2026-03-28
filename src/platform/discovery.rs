@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::Result;
@@ -11,6 +12,13 @@ use sysinfo::DiskKind;
 use sysinfo::Disks;
 
 use crate::core::types::{DeviceAvailability, DeviceInfo};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceEjectOutcome {
+    Ejected,
+    Unsupported(String),
+    Failed(String),
+}
 
 pub trait DeviceDiscovery {
     fn discover(&self) -> Result<Vec<DeviceInfo>>;
@@ -23,6 +31,40 @@ impl DeviceDiscovery for SystemDeviceDiscovery {
     fn discover(&self) -> Result<Vec<DeviceInfo>> {
         Ok(discover_devices())
     }
+}
+
+pub fn eject_device(device: &DeviceInfo) -> DeviceEjectOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        return run_command(
+            "diskutil",
+            &[String::from("eject"), device.mount_path.display().to_string()],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return run_command("umount", &[device.mount_path.display().to_string()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mount = windows_mount_identifier(&device.mount_path);
+        return run_command(
+            "powershell",
+            &[
+                String::from("-NoProfile"),
+                String::from("-Command"),
+                format!(
+                    "(New-Object -comObject Shell.Application).Namespace(17).ParseName('{}').InvokeVerb('Eject')",
+                    mount
+                ),
+            ],
+        );
+    }
+
+    #[allow(unreachable_code)]
+    DeviceEjectOutcome::Unsupported("safe eject is not supported on this platform".to_string())
 }
 
 pub fn discover_devices() -> Vec<DeviceInfo> {
@@ -75,6 +117,36 @@ fn debug_discovery_log(message: impl AsRef<str>) {
     };
 
     let _ = writeln!(file, "{}", message.as_ref());
+}
+
+fn run_command(program: &str, args: &[String]) -> DeviceEjectOutcome {
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => DeviceEjectOutcome::Ejected,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("{program} exited with status {}", output.status)
+            };
+            DeviceEjectOutcome::Failed(detail)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DeviceEjectOutcome::Unsupported(format!("{program} is not available on this system"))
+        }
+        Err(error) => DeviceEjectOutcome::Failed(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_mount_identifier(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .trim_end_matches(['\\', '/'])
+        .to_string()
 }
 
 pub fn validate_selected_device(
@@ -405,5 +477,12 @@ mod tests {
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].display_name, "NIKON Z 6_2");
         assert_eq!(devices[1].display_name, "SD_CARD");
+    }
+
+    #[test]
+    fn reports_missing_eject_command_as_unsupported() {
+        let outcome = run_command("__sorted_missing_command__", &[]);
+
+        assert!(matches!(outcome, DeviceEjectOutcome::Unsupported(_)));
     }
 }
