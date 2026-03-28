@@ -117,7 +117,7 @@ This repository is configured so `cargo-release`:
 ## TODO
 
 - [x] Make tree-view pagination auto-scroll so lower entries remain visible when changing pages
-- [ ] Add more convenient file navigation and file operation capabilities
+- [x] Add more convenient file navigation and file operation capabilities
 
 ## OpenSpec
 
