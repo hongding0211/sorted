@@ -30,6 +30,7 @@ fn copy_plan_and_execution_report_failures_and_successes() {
     let plan = plan_copy(
         &settings,
         "winter shoot",
+        None,
         &device,
         device_root.path(),
         Local.with_ymd_and_hms(2026, 3, 27, 12, 0, 0).unwrap(),

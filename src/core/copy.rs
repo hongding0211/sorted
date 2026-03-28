@@ -165,11 +165,13 @@ pub fn discover_media_files(root: &Path) -> Result<Vec<MediaFile>> {
 pub fn plan_copy(
     settings: &ArchiveSettings,
     theme: &str,
+    device_directory_override: Option<&str>,
     device: &DeviceInfo,
     source_root: &Path,
     now: chrono::DateTime<chrono::Local>,
 ) -> Result<CopyPlan> {
-    let archive_plan = build_archive_plan(settings, theme, device, now)?;
+    let archive_plan =
+        build_archive_plan(settings, theme, device_directory_override, device, now)?;
     validate_archive_destination_available(&archive_plan.archive_root)?;
     let files = discover_media_files(source_root)?;
     Ok(CopyPlan {
@@ -305,6 +307,7 @@ mod tests {
         let plan = plan_copy(
             &settings,
             "shoot",
+            None,
             &device,
             device_root.path(),
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
@@ -345,6 +348,7 @@ mod tests {
         let plan = plan_copy(
             &settings,
             "shoot",
+            None,
             &device,
             &dcim,
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
@@ -379,6 +383,7 @@ mod tests {
         let plan = plan_copy(
             &settings,
             "shoot",
+            None,
             &device,
             device_root.path(),
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
@@ -414,6 +419,7 @@ mod tests {
         let plan = plan_copy(
             &settings,
             "shoot",
+            None,
             &device,
             device_root.path(),
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
@@ -459,6 +465,7 @@ mod tests {
         let plan = plan_copy(
             &settings,
             "shoot",
+            None,
             &device,
             device_root.path(),
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
@@ -510,6 +517,7 @@ mod tests {
         let plan = plan_copy(
             &settings,
             "shoot",
+            None,
             &device,
             &source_root,
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
@@ -542,5 +550,41 @@ mod tests {
         assert_eq!(progress.elapsed, Duration::from_secs(2));
         assert_eq!(progress.bytes_per_second, Some(300));
         assert_eq!(progress.estimated_remaining, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn plans_copy_with_device_directory_override() {
+        let device_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        fs::write(device_root.path().join("frame.jpg"), "image").unwrap();
+
+        let settings = ArchiveSettings {
+            destination_root: destination_root.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: device_root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = plan_copy(
+            &settings,
+            "shoot",
+            Some("Card A/Main"),
+            &device,
+            device_root.path(),
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.archive_plan.archive_root,
+            destination_root
+                .path()
+                .join("shoot_2026-03-27")
+                .join("Card_A_Main")
+        );
     }
 }

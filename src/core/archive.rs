@@ -11,6 +11,7 @@ use crate::core::{
 pub fn build_archive_plan(
     settings: &ArchiveSettings,
     theme: &str,
+    device_directory_override: Option<&str>,
     device: &DeviceInfo,
     now: DateTime<Local>,
 ) -> Result<ArchivePlan> {
@@ -32,7 +33,8 @@ pub fn build_archive_plan(
         bail!("theme must contain at least one valid path character");
     }
 
-    let normalized_device = normalize_path_component(&device.display_name);
+    let normalized_device =
+        normalize_path_component(effective_device_directory_name(device, device_directory_override));
     if normalized_device.is_empty() {
         bail!("device name must contain at least one valid path character");
     }
@@ -49,6 +51,16 @@ pub fn build_archive_plan(
         destination_root,
         archive_root,
     })
+}
+
+pub fn effective_device_directory_name<'a>(
+    device: &'a DeviceInfo,
+    device_directory_override: Option<&'a str>,
+) -> &'a str {
+    device_directory_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&device.display_name)
 }
 
 pub fn normalize_path_component(input: &str) -> String {
@@ -124,6 +136,7 @@ mod tests {
         let plan = build_archive_plan(
             &settings,
             "xxx travel",
+            None,
             &device,
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
         )
@@ -164,6 +177,7 @@ mod tests {
         let plan = build_archive_plan(
             &settings,
             "xxx travel",
+            None,
             &device,
             Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
         )
@@ -175,6 +189,66 @@ mod tests {
             home.join(&suffix)
                 .join("xxx_travel_2026-03-27")
                 .join("EOS_R6")
+        );
+    }
+
+    #[test]
+    fn uses_device_directory_override_in_archive_plan() {
+        let root = tempdir().unwrap();
+        let settings = ArchiveSettings {
+            destination_root: root.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = build_archive_plan(
+            &settings,
+            "xxx travel",
+            Some("Primary Card"),
+            &device,
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.archive_root,
+            root.path()
+                .join("xxx_travel_2026-03-27")
+                .join("Primary_Card")
+        );
+    }
+
+    #[test]
+    fn blank_device_directory_override_falls_back_to_detected_name() {
+        let root = tempdir().unwrap();
+        let settings = ArchiveSettings {
+            destination_root: root.path().to_path_buf(),
+            date_format: "%Y-%m-%d".to_string(),
+        };
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+
+        let plan = build_archive_plan(
+            &settings,
+            "xxx travel",
+            Some("   "),
+            &device,
+            Local.with_ymd_and_hms(2026, 3, 27, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.archive_root,
+            root.path().join("xxx_travel_2026-03-27").join("EOS_R6")
         );
     }
 }

@@ -43,6 +43,7 @@ pub struct ImportSession {
     pub selected_device: Option<DeviceInfo>,
     pub selected_source: Option<PathBuf>,
     pub theme: String,
+    pub device_directory_override: String,
     pub resolved_destination: Option<PathBuf>,
 }
 
@@ -52,6 +53,7 @@ impl Default for ImportSession {
             selected_device: None,
             selected_source: None,
             theme: String::new(),
+            device_directory_override: String::new(),
             resolved_destination: None,
         }
     }

@@ -55,6 +55,7 @@ enum Screen {
 enum FocusField {
     SourceTree,
     Theme,
+    DeviceDirectoryOverride,
     DestinationRoot,
     DateFormat,
 }
@@ -279,16 +280,60 @@ fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Some(app.import_session.theme.clone())
     };
-
+    let device_directory_override = if app.import_session.device_directory_override.trim().is_empty()
+    {
+        None
+    } else {
+        Some(app.import_session.device_directory_override.clone())
+    };
+    let detected_device_name = app
+        .selected_device()
+        .map(|device| device.display_name)
+        .unwrap_or_else(|| "No device selected".to_string());
     let content = Paragraph::new(vec![
-        Line::from(vec![Span::styled("THEME", section_style())]),
+        Line::from(vec![Span::styled(
+            "THEME",
+            field_style(app, FocusField::Theme),
+        )]),
         Line::from(vec![
             Span::styled("  ", helper_style()),
             match theme {
                 Some(ref value) => Span::styled(value.clone(), field_style(app, FocusField::Theme)),
+                None if app.focus == FocusField::Theme => {
+                    Span::styled("Type a theme...", field_style(app, FocusField::Theme))
+                }
                 None => Span::raw(""),
             },
         ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "DEVICE DIRECTORY",
+            field_style(app, FocusField::DeviceDirectoryOverride),
+        )]),
+        Line::from(vec![
+            Span::styled("  ", helper_style()),
+            match device_directory_override {
+                Some(ref value) => Span::styled(
+                    value.clone(),
+                    field_style(app, FocusField::DeviceDirectoryOverride),
+                ),
+                None if app.focus == FocusField::DeviceDirectoryOverride => Span::styled(
+                    "Type an override...",
+                    field_style(app, FocusField::DeviceDirectoryOverride),
+                ),
+                None => Span::raw(""),
+            },
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", helper_style()),
+            Span::styled("Fallback: ", label_style()),
+            Span::raw(detected_device_name),
+        ]),
+        Line::from(Span::styled(
+            "  Overrides only the archive folder name for this import.",
+            helper_style(),
+        )),
         Line::from(""),
         Line::from(vec![Span::styled("TARGET", section_style())]),
         Line::from(vec![
@@ -313,7 +358,10 @@ fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ])
     .block(panel_block(
         "Archive Target",
-        app.focus == FocusField::Theme,
+        matches!(
+            app.focus,
+            FocusField::Theme | FocusField::DeviceDirectoryOverride
+        ),
     ))
     .wrap(Wrap { trim: true });
     frame.render_widget(content, area);
@@ -452,6 +500,7 @@ fn draw_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .selected_source()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No source folder selected".to_string());
+    let device_directory = app.confirmation_device_directory_display();
     let modal = Paragraph::new(vec![
         Line::from(vec![Span::styled("Ready to archive", title_style())]),
         Line::from(Span::styled(
@@ -474,6 +523,10 @@ fn draw_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             } else {
                 &app.import_session.theme
             }),
+        ]),
+        Line::from(vec![
+            Span::styled("Device Directory: ", label_style()),
+            Span::raw(device_directory),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -870,6 +923,7 @@ impl App {
         self.focus = match self.screen {
             Screen::Main | Screen::Confirmation | Screen::CopyResults => match self.focus {
                 FocusField::SourceTree => FocusField::Theme,
+                FocusField::Theme => FocusField::DeviceDirectoryOverride,
                 _ => FocusField::SourceTree,
             },
             Screen::Settings => match self.focus {
@@ -1067,12 +1121,30 @@ impl App {
                     self.focus = FocusField::Theme;
                     return Ok(());
                 }
-                let archive_plan = build_archive_plan(
+                let archive_plan = match build_archive_plan(
                     &self.settings,
                     &self.import_session.theme,
+                    self.device_directory_override(),
                     &selected_device,
                     Local::now(),
-                )?;
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        self.status_message =
+                            StatusMessage::error(format!("Import preview could not be prepared: {error}"));
+                        self.focus = if self
+                            .import_session
+                            .device_directory_override
+                            .trim()
+                            .is_empty()
+                        {
+                            FocusField::Theme
+                        } else {
+                            FocusField::DeviceDirectoryOverride
+                        };
+                        return Ok(());
+                    }
+                };
                 if archive_destination_exists(&archive_plan.archive_root) {
                     self.status_message = StatusMessage::error(format!(
                         "Archive destination {} already exists.",
@@ -1143,6 +1215,9 @@ impl App {
             FocusField::Theme => {
                 self.import_session.theme.pop();
             }
+            FocusField::DeviceDirectoryOverride if self.screen == Screen::Main => {
+                self.import_session.device_directory_override.pop();
+            }
             FocusField::DateFormat if self.screen == Screen::Settings => {
                 self.settings.date_format.pop();
             }
@@ -1157,6 +1232,9 @@ impl App {
 
         match self.focus {
             FocusField::Theme if self.screen == Screen::Main => self.import_session.theme.push(ch),
+            FocusField::DeviceDirectoryOverride if self.screen == Screen::Main => {
+                self.import_session.device_directory_override.push(ch)
+            }
             FocusField::DateFormat if self.screen == Screen::Settings => {
                 self.settings.date_format.push(ch)
             }
@@ -1169,6 +1247,7 @@ impl App {
         build_archive_plan(
             &self.settings,
             &self.import_session.theme,
+            self.device_directory_override(),
             &device,
             Local::now(),
         )
@@ -1200,6 +1279,7 @@ impl App {
         let plan = match plan_copy(
             &self.settings,
             &self.import_session.theme,
+            self.device_directory_override(),
             &selected,
             &source_root,
             Local::now(),
@@ -1207,7 +1287,13 @@ impl App {
             Ok(plan) => plan,
             Err(error) => {
                 self.screen = Screen::Main;
-                self.focus = FocusField::SourceTree;
+                self.focus = if error.to_string().contains("device name")
+                    && !self.import_session.device_directory_override.trim().is_empty()
+                {
+                    FocusField::DeviceDirectoryOverride
+                } else {
+                    FocusField::SourceTree
+                };
                 self.status_message =
                     StatusMessage::error(format!("Import could not start: {error}"));
                 return Ok(());
@@ -1384,6 +1470,7 @@ impl App {
         self.source_index = 0;
         self.import_session.selected_device = None;
         self.import_session.selected_source = None;
+        self.import_session.device_directory_override.clear();
         self.source_summary = AsyncValue::Idle;
         self.source_summary_path = None;
 
@@ -1511,6 +1598,11 @@ impl App {
     }
 
     fn sync_selection_from_index(&mut self) {
+        let previous_device_id = self
+            .import_session
+            .selected_device
+            .as_ref()
+            .map(|device| device.id.clone());
         if let Some(entry) = self.source_entries.get(self.source_index) {
             self.import_session.selected_source = Some(entry.path.clone());
             self.import_session.selected_device = self
@@ -1518,6 +1610,14 @@ impl App {
                 .iter()
                 .find(|device| device.id == entry.device_id)
                 .cloned();
+            let next_device_id = self
+                .import_session
+                .selected_device
+                .as_ref()
+                .map(|device| device.id.clone());
+            if previous_device_id != next_device_id {
+                self.import_session.device_directory_override.clear();
+            }
             self.request_source_summary(entry.path.clone());
         }
     }
@@ -1528,6 +1628,23 @@ impl App {
 
     fn selected_device(&self) -> Option<DeviceInfo> {
         self.import_session.selected_device.clone()
+    }
+
+    fn device_directory_override(&self) -> Option<&str> {
+        Some(self.import_session.device_directory_override.as_str())
+    }
+
+    fn confirmation_device_directory_display(&self) -> String {
+        let Some(device) = self.selected_device() else {
+            return "No device selected".to_string();
+        };
+
+        let override_value = self.import_session.device_directory_override.trim();
+        if override_value.is_empty() {
+            format!("Detected device name ({})", device.display_name)
+        } else {
+            format!("Override: {}", override_value)
+        }
     }
 
     fn settings_browser_root(&self) -> Option<PathBuf> {
@@ -2033,9 +2150,12 @@ fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
                 "Arrows or j/k move | h goes to parent or collapses | l expands folders | Ctrl+U/Ctrl+D move half a page | Tab switches to theme | Enter reviews the import"
             }
             FocusField::Theme => {
-                "Type to edit the theme | Tab switches back to source browsing | Enter reviews the import"
+                "Type to edit the theme | Tab switches to device directory override | Enter reviews the import"
             }
-            _ => "Tab cycles focus between source browsing and theme entry.",
+            FocusField::DeviceDirectoryOverride => {
+                "Type to override the archive folder name for this import | Tab switches back to source browsing | Enter reviews the import"
+            }
+            _ => "Tab cycles focus between source browsing and import fields.",
         },
         Screen::Settings => match focus {
             FocusField::DestinationRoot => {
@@ -2309,6 +2429,8 @@ mod tests {
         assert!(
             contextual_help(Screen::Main, FocusField::SourceTree).contains("Ctrl+U/Ctrl+D")
         );
+        assert!(contextual_help(Screen::Main, FocusField::DeviceDirectoryOverride)
+            .contains("archive folder name"));
         assert!(
             contextual_help(Screen::CopyResults, FocusField::SourceTree).contains("Enter or Esc")
         );
@@ -2443,6 +2565,128 @@ mod tests {
         assert_eq!(app.focus, FocusField::Theme);
         assert_eq!(app.status_message.kind, StatusKind::Warning);
         assert!(app.status_message.text.contains("Enter a theme"));
+    }
+
+    #[test]
+    fn tab_cycles_through_main_workflow_override_field() {
+        let mut app = test_app();
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusField::Theme);
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusField::DeviceDirectoryOverride);
+
+        app.cycle_focus();
+        assert_eq!(app.focus, FocusField::SourceTree);
+    }
+
+    #[test]
+    fn override_text_input_accepts_vim_keys_as_text() {
+        let mut app = test_app();
+        app.focus = FocusField::DeviceDirectoryOverride;
+
+        for ch in ['h', 'j', 'k', 'l'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        assert_eq!(app.import_session.device_directory_override, "hjkl");
+    }
+
+    #[test]
+    fn preview_path_uses_device_directory_override() {
+        let mut app = test_app();
+        let root = tempdir().unwrap();
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.import_session.selected_device = Some(device);
+        app.import_session.theme = "shoot".to_string();
+        app.import_session.device_directory_override = "Primary Card".to_string();
+
+        let preview = app.preview_path().unwrap();
+
+        assert!(preview.ends_with("shoot_2026-03-28/Primary_Card") || preview.contains("Primary_Card"));
+    }
+
+    #[test]
+    fn confirmation_display_shows_detected_name_when_override_is_empty() {
+        let mut app = test_app();
+        let root = tempdir().unwrap();
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.import_session.selected_device = Some(device);
+
+        assert_eq!(
+            app.confirmation_device_directory_display(),
+            "Detected device name (EOS R6)"
+        );
+    }
+
+    #[test]
+    fn changing_selected_device_clears_directory_override() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let first = root.path().join("DCIM");
+        let second = root.path().join("PRIVATE");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        app.devices = vec![
+            DeviceInfo {
+                id: "cam-a".to_string(),
+                display_name: "EOS R6".to_string(),
+                mount_path: root.path().to_path_buf(),
+                availability: DeviceAvailability::Available,
+            },
+            DeviceInfo {
+                id: "cam-b".to_string(),
+                display_name: "SD Card".to_string(),
+                mount_path: root.path().to_path_buf(),
+                availability: DeviceAvailability::Available,
+            },
+        ];
+        app.source_entries = vec![
+            SourceEntry {
+                device_id: "cam-a".to_string(),
+                path: first.clone(),
+                label: "DCIM".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_loading: false,
+                is_device_root: false,
+                is_available: true,
+            },
+            SourceEntry {
+                device_id: "cam-b".to_string(),
+                path: second.clone(),
+                label: "PRIVATE".to_string(),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_loading: false,
+                is_device_root: false,
+                is_available: true,
+            },
+        ];
+
+        app.source_index = 0;
+        app.sync_selection_from_index();
+        app.import_session.device_directory_override = "Custom Card".to_string();
+
+        app.source_index = 1;
+        app.sync_selection_from_index();
+
+        assert!(app.import_session.device_directory_override.is_empty());
     }
 
     #[test]
