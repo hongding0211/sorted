@@ -266,6 +266,7 @@ fn draw_source_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     frame.render_stateful_widget(widget, area, &mut state);
     app.source_scroll_offset = state.offset();
+    app.source_viewport_height = browser_viewport_height(area);
 }
 
 fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -360,6 +361,7 @@ fn draw_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     frame.render_stateful_widget(browser, top[0], &mut state);
     app.settings_scroll_offset = state.offset();
+    app.settings_viewport_height = browser_viewport_height(top[0]);
 
     let fields = Paragraph::new(vec![
         Line::from(vec![Span::styled("Settings", title_style())]),
@@ -636,6 +638,7 @@ struct App {
     source_entries: Vec<SourceEntry>,
     source_index: usize,
     source_scroll_offset: usize,
+    source_viewport_height: usize,
     import_session: ImportSession,
     status_message: StatusMessage,
     screen: Screen,
@@ -656,6 +659,7 @@ struct App {
     settings_entries: Vec<SourceEntry>,
     settings_index: usize,
     settings_scroll_offset: usize,
+    settings_viewport_height: usize,
 }
 
 impl App {
@@ -674,6 +678,7 @@ impl App {
             source_entries: Vec::new(),
             source_index: 0,
             source_scroll_offset: 0,
+            source_viewport_height: 0,
             import_session: ImportSession::default(),
             status_message: StatusMessage::info(
                 "Starting up. Scanning devices in the background...",
@@ -696,6 +701,7 @@ impl App {
             settings_entries: Vec::new(),
             settings_index: 0,
             settings_scroll_offset: 0,
+            settings_viewport_height: 0,
         };
         app.request_device_refresh();
         app.request_destination_free_space();
@@ -718,6 +724,12 @@ impl App {
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') => self.request_device_refresh(),
                 KeyCode::Char('s') | KeyCode::Char('S') => self.open_settings(),
+                KeyCode::Char('d') | KeyCode::Char('D') if self.is_directory_focus() => {
+                    self.move_by_half_page(1)
+                }
+                KeyCode::Char('u') | KeyCode::Char('U') if self.is_directory_focus() => {
+                    self.move_by_half_page(-1)
+                }
                 _ => {}
             }
             return Ok(false);
@@ -734,6 +746,18 @@ impl App {
             KeyCode::Left => self.handle_left(),
             KeyCode::Right => self.handle_right(),
             KeyCode::Backspace => self.handle_backspace(),
+            KeyCode::Char('h') | KeyCode::Char('H') if self.is_directory_focus() => {
+                self.handle_left()
+            }
+            KeyCode::Char('j') | KeyCode::Char('J') if self.is_directory_focus() => {
+                self.move_selection(1)
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') if self.is_directory_focus() => {
+                self.move_selection(-1)
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') if self.is_directory_focus() => {
+                self.handle_right()
+            }
             KeyCode::Char(ch) => self.handle_char(ch),
             _ => {}
         }
@@ -788,6 +812,14 @@ impl App {
         };
     }
 
+    fn is_directory_focus(&self) -> bool {
+        matches!(
+            (self.screen, self.focus),
+            (Screen::Main, FocusField::SourceTree)
+                | (Screen::Settings, FocusField::DestinationRoot)
+        )
+    }
+
     fn move_selection(&mut self, delta: isize) {
         match (self.screen, self.focus) {
             (Screen::Main, FocusField::SourceTree) => {
@@ -811,29 +843,84 @@ impl App {
         }
     }
 
+    fn move_by_half_page(&mut self, direction: isize) {
+        let step = match (self.screen, self.focus) {
+            (Screen::Main, FocusField::SourceTree) => self.source_viewport_height / 2,
+            (Screen::Settings, FocusField::DestinationRoot) => self.settings_viewport_height / 2,
+            _ => 0,
+        }
+        .max(1) as isize;
+
+        self.move_selection(step * direction);
+    }
+
     fn handle_left(&mut self) {
         match (self.screen, self.focus) {
             (Screen::Main, FocusField::SourceTree) => {
-                let Some(entry) = self.source_entries.get(self.source_index) else {
+                let Some(entry) = self.source_entries.get(self.source_index).cloned() else {
                     return;
                 };
                 if self.expanded_sources.remove(&entry.path) {
                     self.rebuild_source_entries();
-                    self.source_index = self
-                        .source_index
-                        .min(self.source_entries.len().saturating_sub(1));
+                    if let Some(index) = self
+                        .source_entries
+                        .iter()
+                        .position(|candidate| candidate.path == entry.path)
+                    {
+                        self.source_index = index;
+                    }
+                    self.sync_selection_from_index();
+                    return;
+                }
+
+                let Some(parent_path) = visible_parent_path(&self.source_entries, self.source_index)
+                else {
+                    return;
+                };
+
+                if self.expanded_sources.remove(&parent_path) {
+                    self.rebuild_source_entries();
+                    if let Some(index) = self
+                        .source_entries
+                        .iter()
+                        .position(|candidate| candidate.path == parent_path)
+                    {
+                        self.source_index = index;
+                    }
                     self.sync_selection_from_index();
                 }
             }
             (Screen::Settings, FocusField::DestinationRoot) => {
-                let Some(entry) = self.settings_entries.get(self.settings_index) else {
+                let Some(entry) = self.settings_entries.get(self.settings_index).cloned() else {
                     return;
                 };
                 if self.expanded_settings_directories.remove(&entry.path) {
                     self.rebuild_settings_entries();
-                    self.settings_index = self
-                        .settings_index
-                        .min(self.settings_entries.len().saturating_sub(1));
+                    if let Some(index) = self
+                        .settings_entries
+                        .iter()
+                        .position(|candidate| candidate.path == entry.path)
+                    {
+                        self.settings_index = index;
+                    }
+                    return;
+                }
+
+                let Some(parent_path) =
+                    visible_parent_path(&self.settings_entries, self.settings_index)
+                else {
+                    return;
+                };
+
+                if self.expanded_settings_directories.remove(&parent_path) {
+                    self.rebuild_settings_entries();
+                    if let Some(index) = self
+                        .settings_entries
+                        .iter()
+                        .position(|candidate| candidate.path == parent_path)
+                    {
+                        self.settings_index = index;
+                    }
                 }
             }
             _ => {}
@@ -1671,6 +1758,15 @@ fn browser_viewport_height(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 
+fn visible_parent_path(entries: &[SourceEntry], selected_index: usize) -> Option<PathBuf> {
+    let selected = entries.get(selected_index)?;
+    entries[..selected_index]
+        .iter()
+        .rev()
+        .find(|candidate| candidate.depth < selected.depth)
+        .map(|candidate| candidate.path.clone())
+}
+
 fn flatten_settings_tree(
     root: &Path,
     directory_state: &HashMap<PathBuf, DirectoryLoadState>,
@@ -1835,7 +1931,7 @@ fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
     match screen {
         Screen::Main => match focus {
             FocusField::SourceTree => {
-                "Arrows move | Left/Right collapse or expand folders | Tab switches to theme | Enter reviews the import"
+                "Arrows or j/k move | h goes to parent or collapses | l expands folders | Ctrl+U/Ctrl+D move half a page | Tab switches to theme | Enter reviews the import"
             }
             FocusField::Theme => {
                 "Type to edit the theme | Tab switches back to source browsing | Enter reviews the import"
@@ -1844,7 +1940,7 @@ fn contextual_help(screen: Screen, focus: FocusField) -> &'static str {
         },
         Screen::Settings => match focus {
             FocusField::DestinationRoot => {
-                "Arrows move | Left/Right collapse or expand folders | Enter confirms Destination Root | Tab switches to Date Format"
+                "Arrows or j/k move | h goes to parent or collapses | l expands folders | Ctrl+U/Ctrl+D move half a page | Enter confirms Destination Root | Tab switches to Date Format"
             }
             FocusField::DateFormat => {
                 "Type to edit the format | Tab switches back to Destination Root | Enter saves all pending settings | Esc returns"
@@ -2026,6 +2122,7 @@ mod tests {
             source_entries: Vec::new(),
             source_index: 0,
             source_scroll_offset: 0,
+            source_viewport_height: 0,
             import_session: ImportSession::default(),
             status_message: StatusMessage::info("Ready"),
             screen: Screen::Main,
@@ -2046,6 +2143,7 @@ mod tests {
             settings_entries: Vec::new(),
             settings_index: 0,
             settings_scroll_offset: 0,
+            settings_viewport_height: 0,
         }
     }
 
@@ -2055,6 +2153,9 @@ mod tests {
             contextual_help(Screen::Settings, FocusField::DestinationRoot).contains("confirms")
         );
         assert!(contextual_help(Screen::Settings, FocusField::DateFormat).contains("saves"));
+        assert!(
+            contextual_help(Screen::Main, FocusField::SourceTree).contains("Ctrl+U/Ctrl+D")
+        );
         assert!(
             contextual_help(Screen::CopyResults, FocusField::SourceTree).contains("Enter or Esc")
         );
@@ -2317,6 +2418,279 @@ mod tests {
         assert_eq!(app.settings.destination_root, sibling);
         assert_eq!(app.persisted_settings.destination_root, sibling);
         assert_eq!(app.config_store.load().unwrap().destination_root, sibling);
+    }
+
+    #[test]
+    fn vim_keys_navigate_source_tree_when_directory_is_focused() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let parent = root.path().join("DCIM");
+        let child = parent.join("100CANON");
+        fs::create_dir_all(&child).unwrap();
+
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.devices = vec![device];
+        app.directory_state.insert(
+            root.path().to_path_buf(),
+            DirectoryLoadState::Loaded(vec![parent.clone()]),
+        );
+        app.directory_state.insert(
+            parent.clone(),
+            DirectoryLoadState::Loaded(vec![child.clone()]),
+        );
+        app.expanded_sources.insert(root.path().to_path_buf());
+        app.rebuild_source_entries();
+        app.source_index = app
+            .source_entries
+            .iter()
+            .position(|entry| entry.path == parent)
+            .unwrap();
+        app.sync_selection_from_index();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.expanded_sources.contains(&parent));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_source(), Some(child.clone()));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_source(), Some(parent.clone()));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.expanded_sources.contains(&parent));
+    }
+
+    #[test]
+    fn vim_keys_remain_text_input_when_theme_is_focused() {
+        let mut app = test_app();
+        app.focus = FocusField::Theme;
+
+        for ch in ['h', 'j', 'k', 'l'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        assert_eq!(app.import_session.theme, "hjkl");
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_move_half_a_page_in_settings_browser() {
+        let mut app = test_app();
+        app.screen = Screen::Settings;
+        app.focus = FocusField::DestinationRoot;
+        app.settings_viewport_height = 6;
+        app.settings_entries = (0..12)
+            .map(|index| SourceEntry {
+                device_id: String::new(),
+                path: PathBuf::from(format!("/tmp/{index}")),
+                label: format!("dir-{index}"),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_loading: false,
+                is_device_root: false,
+                is_available: true,
+            })
+            .collect();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.settings_index, 3);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.settings_index, 6);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.settings_index, 3);
+    }
+
+    #[test]
+    fn ctrl_d_is_ignored_when_directory_focus_is_not_active() {
+        let mut app = test_app();
+        app.focus = FocusField::Theme;
+        app.source_viewport_height = 6;
+        app.source_entries = (0..12)
+            .map(|index| SourceEntry {
+                device_id: String::new(),
+                path: PathBuf::from(format!("/tmp/{index}")),
+                label: format!("dir-{index}"),
+                depth: 0,
+                is_expanded: false,
+                has_children: false,
+                is_loading: false,
+                is_device_root: false,
+                is_available: true,
+            })
+            .collect();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.source_index, 0);
+        assert!(app.import_session.theme.is_empty());
+    }
+
+    #[test]
+    fn left_on_expanded_source_folder_collapses_that_folder() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let parent = root.path().join("DCIM");
+        let child = parent.join("100CANON");
+        fs::create_dir_all(&child).unwrap();
+
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.devices = vec![device];
+        app.directory_state.insert(
+            root.path().to_path_buf(),
+            DirectoryLoadState::Loaded(vec![parent.clone()]),
+        );
+        app.directory_state.insert(
+            parent.clone(),
+            DirectoryLoadState::Loaded(vec![child.clone()]),
+        );
+        app.expanded_sources.insert(root.path().to_path_buf());
+        app.expanded_sources.insert(parent.clone());
+        app.rebuild_source_entries();
+        app.source_index = app
+            .source_entries
+            .iter()
+            .position(|entry| entry.path == parent)
+            .unwrap();
+        app.sync_selection_from_index();
+
+        app.handle_left();
+
+        assert!(!app.expanded_sources.contains(&parent));
+        assert_eq!(
+            app.source_entries
+                .iter()
+                .position(|entry| entry.path == parent),
+            Some(app.source_index)
+        );
+        assert!(!app.source_entries.iter().any(|entry| entry.path == child));
+        assert_eq!(app.selected_source(), Some(parent));
+    }
+
+    #[test]
+    fn left_on_source_child_returns_to_parent_and_collapses_parent() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let parent = root.path().join("DCIM");
+        let child = parent.join("100CANON");
+        fs::create_dir_all(&child).unwrap();
+
+        let device = DeviceInfo {
+            id: "cam".to_string(),
+            display_name: "EOS R6".to_string(),
+            mount_path: root.path().to_path_buf(),
+            availability: DeviceAvailability::Available,
+        };
+        app.devices = vec![device];
+        app.directory_state.insert(
+            root.path().to_path_buf(),
+            DirectoryLoadState::Loaded(vec![parent.clone()]),
+        );
+        app.directory_state.insert(
+            parent.clone(),
+            DirectoryLoadState::Loaded(vec![child.clone()]),
+        );
+        app.expanded_sources.insert(root.path().to_path_buf());
+        app.expanded_sources.insert(parent.clone());
+        app.rebuild_source_entries();
+        app.source_index = app
+            .source_entries
+            .iter()
+            .position(|entry| entry.path == child)
+            .unwrap();
+        app.sync_selection_from_index();
+
+        app.handle_left();
+
+        assert!(!app.expanded_sources.contains(&parent));
+        assert_eq!(
+            app.source_entries
+                .iter()
+                .position(|entry| entry.path == parent),
+            Some(app.source_index)
+        );
+        assert!(!app.source_entries.iter().any(|entry| entry.path == child));
+        assert_eq!(app.selected_source(), Some(parent));
+    }
+
+    #[test]
+    fn left_on_expanded_settings_folder_collapses_that_folder() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let current = root.path().join("current");
+        let child = current.join("nested");
+        fs::create_dir_all(&child).unwrap();
+        app.settings.destination_root = child.clone();
+        app.persisted_settings = app.settings.clone();
+
+        app.open_settings();
+        app.settings_index = app
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == current)
+            .unwrap();
+
+        app.handle_left();
+
+        assert!(!app.expanded_settings_directories.contains(&current));
+        assert_eq!(
+            app.settings_entries
+                .iter()
+                .position(|entry| entry.path == current),
+            Some(app.settings_index)
+        );
+        assert!(!app.settings_entries.iter().any(|entry| entry.path == child));
+    }
+
+    #[test]
+    fn left_on_settings_child_returns_to_parent_and_collapses_parent() {
+        let mut app = test_app();
+        let root = visible_tempdir();
+        let current = root.path().join("current");
+        let child = current.join("nested");
+        let sibling = current.join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app.settings.destination_root = child.clone();
+        app.persisted_settings = app.settings.clone();
+
+        app.open_settings();
+        app.settings_index = app
+            .settings_entries
+            .iter()
+            .position(|entry| entry.path == sibling)
+            .unwrap();
+
+        app.handle_left();
+
+        assert!(!app.expanded_settings_directories.contains(&current));
+        assert_eq!(
+            app.settings_entries
+                .iter()
+                .position(|entry| entry.path == current),
+            Some(app.settings_index)
+        );
+        assert!(!app.settings_entries.iter().any(|entry| entry.path == sibling));
     }
 
     #[test]
