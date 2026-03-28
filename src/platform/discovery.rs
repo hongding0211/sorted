@@ -35,6 +35,13 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
         devices.insert(device.id.clone(), device);
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        for device in discover_linux_mount_devices() {
+            devices.insert(device.id.clone(), device);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         for device in discover_macos_volume_devices() {
@@ -131,6 +138,89 @@ fn should_include_linux_disk(is_removable: bool, mount_point: &Path) -> bool {
     is_removable && has_browsable_mount_point(mount_point)
 }
 
+#[cfg(target_os = "linux")]
+fn discover_linux_mount_devices() -> Vec<DeviceInfo> {
+    discover_linux_mount_devices_with(Path::new("/proc/mounts"), linux_mount_device_is_removable)
+}
+
+#[cfg(target_os = "linux")]
+fn discover_linux_mount_devices_with<F>(mounts_path: &Path, is_removable: F) -> Vec<DeviceInfo>
+where
+    F: Fn(&str) -> bool,
+{
+    let Ok(contents) = fs::read_to_string(mounts_path) else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(parse_linux_mount_entry)
+        .filter(|(source, mount_path)| {
+            source.starts_with("/dev/")
+                && has_browsable_mount_point(mount_path)
+                && linux_mount_device_name(source)
+                    .as_deref()
+                    .is_some_and(&is_removable)
+        })
+        .map(|(_, mount_path)| {
+            let raw_name = mount_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+            build_device_info(&raw_name, mount_path)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_mount_entry(line: &str) -> Option<(String, PathBuf)> {
+    let mut fields = line.split_whitespace();
+    let source = decode_mount_field(fields.next()?);
+    let mount_path = PathBuf::from(decode_mount_field(fields.next()?));
+    Some((source, mount_path))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_device_is_removable(device_name: &str) -> bool {
+    fs::read_to_string(Path::new("/sys/block").join(device_name).join("removable"))
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_device_name(source: &str) -> Option<String> {
+    let device = Path::new(source).file_name()?.to_str()?;
+    Some(linux_parent_block_device_name(device))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_block_device_name(device: &str) -> String {
+    if let Some(prefix) = device.strip_suffix(|ch: char| ch.is_ascii_digit()) {
+        if !prefix.is_empty() && !prefix.ends_with('p') {
+            return prefix.to_string();
+        }
+    }
+
+    if let Some((prefix, _)) = device.rsplit_once('p') {
+        if prefix.chars().last().is_some_and(|ch| ch.is_ascii_digit()) {
+            return prefix.to_string();
+        }
+    }
+
+    device.to_string()
+}
+
 #[cfg(target_os = "windows")]
 fn should_include_windows_disk(kind: DiskKind, is_removable: bool, mount_point: &Path) -> bool {
     kind != DiskKind::Unknown(-1) && is_removable && has_browsable_mount_point(mount_point)
@@ -221,6 +311,39 @@ mod tests {
         let mount = tempdir().unwrap();
 
         assert!(!should_include_linux_disk(false, mount.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovers_linux_removable_mounts_from_proc_mounts_fallback() {
+        let root = tempdir().unwrap();
+        let mount_path = root.path().join("share/external/DEV3301_1");
+        fs::create_dir_all(&mount_path).unwrap();
+        let mounts = root.path().join("mounts");
+        fs::write(
+            &mounts,
+            format!(
+                "/dev/sdd1 {} exfat rw,relatime 0 0\n/dev/md9 /mnt/HDA_ROOT ext4 rw 0 0\n",
+                mount_path.display()
+            ),
+        )
+        .unwrap();
+
+        let devices =
+            discover_linux_mount_devices_with(&mounts, |device_name| device_name == "sdd");
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].mount_path, mount_path);
+        assert_eq!(devices[0].display_name, "DEV3301_1");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_parent_block_device_names() {
+        assert_eq!(linux_parent_block_device_name("sdd1"), "sdd");
+        assert_eq!(linux_parent_block_device_name("mmcblk0p1"), "mmcblk0");
+        assert_eq!(linux_parent_block_device_name("nvme0n1p1"), "nvme0n1");
+        assert_eq!(linux_parent_block_device_name("sdd"), "sdd");
     }
 
     #[cfg(target_os = "windows")]
