@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -27,7 +28,14 @@ impl DeviceDiscovery for SystemDeviceDiscovery {
 pub fn discover_devices() -> Vec<DeviceInfo> {
     let mut devices = BTreeMap::new();
     let disks = Disks::new_with_refreshed_list();
+    debug_discovery_log(format!("sysinfo disks: {}", disks.len()));
     for disk in disks.iter().filter(|disk| should_include_disk(disk)) {
+        debug_discovery_log(format!(
+            "sysinfo accepted: name={} mount={} removable={}",
+            disk.name().to_string_lossy(),
+            disk.mount_point().display(),
+            disk.is_removable()
+        ));
         let device = build_device_info(
             disk.name().to_string_lossy().as_ref(),
             disk.mount_point().to_path_buf(),
@@ -38,6 +46,11 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
     #[cfg(target_os = "linux")]
     {
         for device in discover_linux_mount_devices() {
+            debug_discovery_log(format!(
+                "linux fallback accepted: name={} mount={}",
+                device.display_name,
+                device.mount_path.display()
+            ));
             devices.insert(device.id.clone(), device);
         }
     }
@@ -50,6 +63,18 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
     }
 
     devices.into_values().collect()
+}
+
+fn debug_discovery_log(message: impl AsRef<str>) {
+    let Ok(path) = std::env::var("SORTED_DISCOVERY_LOG") else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+
+    let _ = writeln!(file, "{}", message.as_ref());
 }
 
 pub fn validate_selected_device(
@@ -149,6 +174,10 @@ where
     F: Fn(&str) -> bool,
 {
     let Ok(contents) = fs::read_to_string(mounts_path) else {
+        debug_discovery_log(format!(
+            "linux fallback: could not read mounts from {}",
+            mounts_path.display()
+        ));
         return Vec::new();
     };
 
@@ -156,11 +185,17 @@ where
         .lines()
         .filter_map(parse_linux_mount_entry)
         .filter(|(source, mount_path)| {
-            source.starts_with("/dev/")
-                && has_browsable_mount_point(mount_path)
-                && linux_mount_device_name(source)
-                    .as_deref()
-                    .is_some_and(&is_removable)
+            let device_name = linux_mount_device_name(source);
+            let removable = device_name.as_deref().is_some_and(&is_removable);
+            debug_discovery_log(format!(
+                "linux fallback candidate: source={} mount={} device={} browsable={} removable={}",
+                source,
+                mount_path.display(),
+                device_name.as_deref().unwrap_or("<unknown>"),
+                has_browsable_mount_point(mount_path),
+                removable
+            ));
+            source.starts_with("/dev/") && has_browsable_mount_point(mount_path) && removable
         })
         .map(|(_, mount_path)| {
             let raw_name = mount_path
